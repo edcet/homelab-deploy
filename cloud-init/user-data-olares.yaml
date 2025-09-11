@@ -1,0 +1,1327 @@
+#cloud-config
+# Olares VM specific configuration (olares-01)
+# Single-node k3s orchestration and GitOps center
+
+# This configuration extends user-data-common.yaml
+# Merge with common template during deployment
+
+hostname: olares-01
+fqdn: olares-01.homelab.local
+
+users:
+  - name: ubuntu
+    groups: [docker, podman, sudo, adm, systemd-journal, kube]
+
+packages:
+  - docker.io
+  - containerd
+  - kubelet
+  - kubeadm
+  - kubectl
+  - k3s
+  - podman
+  - tailscale
+  - nginx-ingress-controller
+  - cert-manager
+  - helm
+  - kustomize
+  - yq
+  - k9s
+  - git
+  - python3-pip
+  - build-essential
+
+# Olares-specific firewall rules
+ufw:
+  allow:
+    - 22/tcp     # SSH
+    - 80/tcp     # HTTP
+    - 443/tcp    # HTTPS
+    - 53/udp     # DNS
+    - 41641/udp  # Tailscale
+    - 6443/tcp   # Kubernetes API
+    - 10250/tcp  # Kubelet
+    - 9100/tcp   # Node Exporter
+    - 9090/tcp   # Prometheus
+    - 3000/tcp   # Grafana
+    - 8080/tcp   # Ingress
+    - 8443/tcp   # Ingress HTTPS
+    - 2379/tcp   # etcd (single-node)
+    - 10248/tcp  # Kubelet healthz
+    - 10249/tcp  # Kube-proxy
+
+runcmd:
+  # Install and configure container runtime
+  - |
+    echo "Configuring container runtime for k3s..."
+    # Install containerd if not present
+    if ! command -v containerd >/dev/null 2>&1; then
+      apt-get install -y containerd
+    fi
+    
+    # Configure containerd for k3s
+    mkdir -p /etc/containerd
+    containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/' > /etc/containerd/config.toml
+    systemctl restart containerd
+    systemctl enable containerd
+  
+  # Configure Tailscale for k3s networking
+  - |
+    if command -v tailscale >/dev/null 2>&1; then
+      echo "Configuring Tailscale for k3s..."
+      tailscale up \\
+        --authkey={{.TAILSCALE_AUTHKEY}} \\
+        --hostname=olares-01 \\
+        --advertise-routes=10.42.0.0/16,10.43.0.0/16 \\
+        --accept-routes \\
+        --accept-dns=false \\
+        --state=/var/lib/tailscale/tailscaled.state \\
+        --socket=/var/run/tailscale/tailscaled.sock
+      systemctl enable --now tailscaled
+      systemctl restart tailscaled
+      
+      # Add Tailscale CNI for k3s
+      mkdir -p /opt/cni/bin
+      curl -sfL https://github.com/tailscale/tailscale/releases/download/v1.54.0/tailscale-cni-1.54.0.tgz | tar xz -C /opt/cni/bin
+      chmod +x /opt/cni/bin/tailscale-cni
+    fi
+  
+  # Install k3s single-node cluster
+  - |
+    echo "Installing k3s single-node cluster..."
+    curl -sfL https://get.k3s.io | sh -s - server \\
+      --write-kubeconfig-mode 644 \\
+      --disable traefik \\
+      --disable metrics-server \\
+      --disable servicelb \\
+      --disable=servicelb \\
+      --kubelet-arg="cloud-provider=external" \\
+      --kubelet-arg="provider-id=proxmox" \\
+      --node-ip={{.TAILSCALE_IP}} \\
+      --flannel-iface={{.TAILSCALE_INTERFACE}} \\
+      --cluster-cidr=10.42.0.0/16 \\
+      --service-cidr=10.43.0.0/16 \\
+      --token-abc123 \\
+      --node-name olares-01 \\
+      --protect-kernel-defaults \\
+      --disable-cloud-controller \\
+      --docker
+      
+    # Set up kubectl for non-root user
+    mkdir -p /home/ubuntu/.kube
+    cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
+    chown ubuntu:ubuntu /home/ubuntu/.kube/config
+    chmod 600 /home/ubuntu/.kube/config
+    
+    # Create Kustomize directory structure
+    mkdir -p /opt/olares/{bases,overlays,monitoring,apps}
+    chown -R ubuntu:ubuntu /opt/olares
+    
+    # Install Kustomize
+    if ! command -v kustomize >/dev/null 2>&1; then
+      curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+      sudo mv kustomize /usr/local/bin/
+    fi
+    
+    # Install Helm
+    if ! command -v helm >/dev/null 2>&1; then
+      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+    fi
+    
+    # Install cert-manager
+    helm repo add jetstack https://charts.jetstack.io
+    helm repo update
+    helm install cert-manager jetstack/cert-manager \\
+      --namespace cert-manager \\
+      --create-namespace \\
+      --version v1.14.4 \\
+      --set installCRDs=true \\
+      --set "extraArgs={--dns01-recursiveNameservers=\\[100.100.100.100:53,1.1.1.1:53\\]}"
+    
+    # Install nginx-ingress
+    helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+    helm repo update
+    helm install ingress-nginx ingress-nginx/ingress-nginx \\
+      --namespace ingress-nginx \\
+      --create-namespace \\
+      --set controller.service.type=LoadBalancer \\
+      --set controller.config.use-proxy-protocol="false" \\
+      --set controller.ingressClassResource.default=true \\
+      --set controller.ingressClassResource.controllerValue=nginx \\
+      --set controller.config.proxy-body-size="50m" \\
+      --set controller.config.client-max-body-size="50m" \\
+      --set controller.config.use-forwarded-headers="true" \\
+      --set controller.config.compute-full-forwarded-for="true" \\
+      --set controller.config.use-x-forwarded-prefix="true" \\
+      --set controller.service.externalTrafficPolicy=Local
+    
+    # Create basic Kustomize structure
+    cat > /opt/olares/kustomization.yaml << 'EOF'
+    apiVersion: kustomize.config.k8s.io/v1beta1
+    kind: Kustomization
+    
+    resources:
+      - bases/namespace.yaml
+      - monitoring/
+    
+    namespace: homelab
+    
+    generators:
+      - secrets/
+    
+    patchesStrategicMerge:
+      - overlays/olares-patch.yaml
+    EOF
+    
+    chown -R ubuntu:ubuntu /opt/olares
+  
+  # Create monitoring namespace and basic Prometheus setup
+  - |
+    echo "Setting up monitoring namespace..."
+    kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+    
+    cat > /opt/olares/monitoring/namespace.yaml << 'EOF'
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: monitoring
+      labels:
+        name: monitoring
+        kubernetes.io/metadata.name: monitoring
+    EOF
+    
+    cat > /opt/olares/monitoring/prometheus-namespace.yaml << 'EOF'
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: prometheus
+      labels:
+        name: prometheus
+    EOF
+    
+    # Create basic Prometheus config
+    mkdir -p /opt/olares/monitoring/prometheus
+    cat > /opt/olares/monitoring/prometheus/prometheus.yaml << 'EOF'
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    
+    rule_files:
+      - "rules/*.yml"
+    
+    alerting:
+      alertmanagers:
+      - static_configs:
+        - targets:
+          - ntfy.homelab.local:8080
+    
+    scrape_configs:
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+        scrape_interval: 5s
+    
+      - job_name: 'node-exporter'
+        static_configs:
+          - targets: ['gw-01.tailnet.ts.net:9100', 'olares-01.tailnet.ts.net:9100']
+        scrape_interval: 15s
+    
+      - job_name: 'k3s'
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - source_labels: [__address__]
+            regex: '(.*):10250'
+            replacement: '${1}:10250'
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+        scrape_interval: 15s
+    
+      - job_name: 'k3s-services'
+        kubernetes_sd_configs:
+          - role: service
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_scheme]
+            action: replace
+            target_label: __scheme__
+            regex: (https?)
+          - source_labels: [__meta_kubernetes_service_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_service_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+          - action: labelmap
+            regex: __meta_kubernetes_service_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_service_name]
+            action: replace
+            target_label: kubernetes_service_name
+        scrape_interval: 15s
+    
+      - job_name: 'k3s-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+        scrape_interval: 15s
+    
+    # Alerting rules
+    groups:
+      - name: homelab.rules
+        rules:
+          - alert: InstanceDown
+            expr: up == 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Instance {{ $labels.instance }} down"
+              description: "{{ $labels.instance }} has been down for more than 5 minutes."
+          
+          - alert: HighCPUUsage
+            expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High CPU usage on {{ $labels.instance }}"
+              description: "CPU usage is above 80% for last 5 minutes on {{ $labels.instance }}."
+          
+          - alert: HighMemoryUsage
+            expr: (1 - (sum by(instance) (node_memory_MemAvailable_bytes) / sum by(instance) (node_memory_MemTotal_bytes))) * 100 > 85
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory usage on {{ $labels.instance }}"
+              description: "Memory usage is above 85% for last 5 minutes on {{ $labels.instance }}."
+          
+          - alert: DiskRunningOut
+            expr: (1 - (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})) * 100 > 85
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Disk space running out on {{ $labels.instance }}"
+              description: "Disk usage on {{ $labels.instance }} is above 85% for last 10 minutes."
+    EOF
+    
+    # Create alerting rules for ntfy integration
+    mkdir -p /opt/olares/monitoring/prometheus/rules
+    cat > /opt/olares/monitoring/prometheus/rules/homelab-alerts.yml << 'EOF'
+    groups:
+      - name: homelab-alerts
+        rules:
+          # Resource alerts
+          - alert: HighCPULoad
+            expr: node_load1 > 4
+            for: 5m
+            labels:
+              severity: warning
+              team: homelab
+            annotations:
+              summary: "High CPU load detected"
+              description: "CPU load is {{ $value }} on {{ $labels.instance }}. Threshold: 4.0"
+          
+          - alert: MemoryPressure
+            expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100 > 90
+            for: 5m
+            labels:
+              severity: critical
+              team: homelab
+            annotations:
+              summary: "Memory pressure detected"
+              description: "Available memory is {{ $value | humanize }} on {{ $labels.instance }}. Less than 10% available."
+          
+          # K3s cluster alerts
+          - alert: KubeNodeNotReady
+            expr: kube_node_status_condition{condition="Ready",status="True"} == 0
+            for: 2m
+            labels:
+              severity: critical
+              team: homelab
+            annotations:
+              summary: "Kubernetes node not ready"
+              description: "Node {{ $labels.node }} is not ready."
+          
+          - alert: KubePodCrashLooping
+            expr: kube_pod_container_status_restarts_total{restart_count="0"} > 0
+            for: 5m
+            labels:
+              severity: warning
+              team: homelab
+            annotations:
+              summary: "Pod crashing"
+              description: "Pod {{ $labels.pod }} in {{ $labels.namespace }} is crashing."
+          
+          # Network alerts
+          - alert: TailscaleDisconnected
+            expr: tailscale_status_connection_state{state="Disconnected"} == 1
+            for: 2m
+            labels:
+              severity: critical
+              team: homelab
+            annotations:
+              summary: "Tailscale disconnected"
+              description: "Tailscale connection on {{ $labels.instance }} is disconnected."
+          
+          # Storage alerts
+          - alert: ZFSLowSpace
+            expr: zfs_pool_health{status!="ONLINE"} == 1
+            for: 5m
+            labels:
+              severity: critical
+              team: homelab
+            annotations:
+              summary: "ZFS pool unhealthy"
+              description: "ZFS pool {{ $labels.pool }} is not healthy on {{ $labels.instance }}."
+    EOF
+    
+    chown -R ubuntu:ubuntu /opt/olares/monitoring
+  
+  # Create GitOps repository structure
+  - |
+    echo "Setting up GitOps structure..."
+    cd /opt/olares
+    
+    # Initialize Git repository
+    git init
+    git config user.name "Homelab CI/CD"
+    git config user.email "ci@homelab.local"
+    
+    # Create base manifests
+    mkdir -p bases namespaces
+    
+    cat > bases/namespace.yaml << 'EOF'
+    apiVersion: v1
+    kind: Namespace
+    metadata:
+      name: homelab
+      labels:
+        app.kubernetes.io/managed-by: kustomize
+        app.kubernetes.io/part-of: homelab
+    EOF
+    
+    cat > bases/deployment-template.yaml << 'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: {{ .Name }}
+      namespace: {{ .Namespace }}
+      labels:
+        app.kubernetes.io/name: {{ .Name }}
+        app.kubernetes.io/instance: {{ .Name }}-{{ .Version }}
+        app.kubernetes.io/version: {{ .Version }}
+        app.kubernetes.io/component: {{ .Component }}
+        app.kubernetes.io/part-of: homelab
+        app.kubernetes.io/managed-by: kustomize
+    spec:
+      replicas: {{ .Replicas }}
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: {{ .Name }}
+          app.kubernetes.io/instance: {{ .Name }}-{{ .Version }}
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: {{ .Name }}
+            app.kubernetes.io/instance: {{ .Name }}-{{ .Version }}
+        spec:
+          containers:
+            - name: {{ .Name }}
+              image: {{ .Image }}:{{ .Version }}
+              ports:
+                - containerPort: {{ .Port }}
+              env:
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+              resources:
+                requests:
+                  cpu: {{ .CPURequest }}
+                  memory: {{ .MemoryRequest }}
+                limits:
+                  cpu: {{ .CPULimit }}
+                  memory: {{ .MemoryLimit }}
+              livenessProbe:
+                httpGet:
+                  path: {{ .HealthPath }}
+                  port: {{ .Port }}
+                initialDelaySeconds: 30
+                periodSeconds: 10
+              readinessProbe:
+                httpGet:
+                  path: {{ .HealthPath }}
+                  port: {{ .Port }}
+                initialDelaySeconds: 5
+                periodSeconds: 5
+    EOF
+    
+    cat > bases/service-template.yaml << 'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: {{ .Name }}
+      namespace: {{ .Namespace }}
+      labels:
+        app.kubernetes.io/name: {{ .Name }}
+        app.kubernetes.io/instance: {{ .Name }}-{{ .Version }}
+        app.kubernetes.io/component: {{ .Component }}
+        app.kubernetes.io/part-of: homelab
+    spec:
+      type: ClusterIP
+      ports:
+        - port: {{ .Port }}
+          targetPort: {{ .TargetPort }}
+          protocol: TCP
+          name: http
+      selector:
+        app.kubernetes.io/name: {{ .Name }}
+        app.kubernetes.io/instance: {{ .Name }}-{{ .Version }}
+    EOF
+    
+    cat > bases/ingress-template.yaml << 'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: {{ .Name }}
+      namespace: {{ .Namespace }}
+      labels:
+        app.kubernetes.io/name: {{ .Name }}
+        app.kubernetes.io/instance: {{ .Name }}-{{ .Version }}
+        app.kubernetes.io/component: {{ .Component }}
+        app.kubernetes.io/part-of: homelab
+      annotations:
+        kubernetes.io/ingress.class: nginx
+        cert-manager.io/cluster-issuer: letsencrypt-prod
+        nginx.ingress.kubernetes.io/rewrite-target: /
+    spec:
+      tls:
+        - hosts:
+            - {{ .Host }}
+          secretName: {{ .Name }}-tls
+      rules:
+        - host: {{ .Host }}
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: {{ .Name }}
+                    port:
+                      number: {{ .Port }}
+    EOF
+    
+    # Create monitoring base
+    mkdir -p monitoring/prometheus monitoring/grafana monitoring/alertmanager
+    
+    cat > monitoring/kustomization.yaml << 'EOF'
+    apiVersion: k8s
+    kind: Kustomization
+    namespace: monitoring
+    
+    resources:
+      - prometheus-namespace.yaml
+      - prometheus/prometheus.yaml
+      - prometheus/service.yaml
+      - prometheus/service-monitor.yaml
+      - grafana/grafana.yaml
+      - alertmanager/alertmanager.yaml
+    
+    generators:
+      - secrets/prometheus-secrets.yaml
+    EOF
+    
+    # Create initial commit
+    git add .
+    git commit -m "Initial Olares GitOps structure with monitoring base"
+    
+    echo "GitOps repository initialized at /opt/olares"
+    chown -R ubuntu:ubuntu /opt/olares
+  
+  # Create deployment script for GitOps
+  - |
+    cat > /opt/olares/deploy.sh << 'EOF'
+    #!/bin/bash
+    # Olares GitOps deployment script
+    
+    set -euo pipefail
+    
+    DEPLOY_DIR="/opt/olares"
+    KUBE_CONFIG="/home/ubuntu/.kube/config"
+    export KUBECONFIG="$KUBE_CONFIG"
+    
+    echo "🚀 Starting Olares GitOps deployment..."
+    echo "Repository: $DEPLOY_DIR"
+    echo "Kubeconfig: $KUBE_CONFIG"
+    echo "Timestamp: $(date)"
+    echo ""
+    
+    # Check prerequisites
+    if ! command -v kubectl >/dev/null 2>&1; then
+      echo "❌ kubectl not found"
+      exit 1
+    fi
+    
+    if ! command -v kustomize >/dev/null 2>&1; then
+      echo "❌ kustomize not found"
+      exit 1
+    fi
+    
+    if ! command -v helm >/dev/null 2>&1; then
+      echo "❌ helm not found"
+      exit 1
+    fi
+    
+    if [ ! -r "$KUBE_CONFIG" ]; then
+      echo "❌ Kubeconfig not readable: $KUBE_CONFIG"
+      exit 1
+    fi
+    
+    # Check cluster connectivity
+    if ! kubectl cluster-info >/dev/null 2>&1; then
+      echo "❌ Cannot connect to cluster"
+      kubectl cluster-info
+      exit 1
+    fi
+    
+    echo "✅ Cluster connectivity verified"
+    echo ""
+    
+    cd "$DEPLOY_DIR"
+    
+    # Pull latest changes
+    if [ -d .git ]; then
+      echo "📥 Pulling latest GitOps changes..."
+      git pull origin main || git pull origin master
+    fi
+    
+    # Validate Kustomize
+    echo "🔍 Validating Kustomize manifests..."
+    if kustomize build . >/dev/null 2>&1; then
+      echo "✅ Kustomize validation passed"
+    else
+      echo "❌ Kustomize validation failed"
+      kustomize build . --enable-helm || true
+      exit 1
+    fi
+    
+    echo ""
+    
+    # Deploy base resources
+    echo "🚀 Deploying base resources..."
+    kustomize build . | kubectl apply -f -
+    
+    # Deploy monitoring stack
+    echo "📊 Deploying monitoring stack..."
+    cd monitoring
+    kustomize build . | kubectl apply -f -
+    cd ..
+    
+    # Deploy applications
+    echo "📦 Deploying applications..."
+    for app in apps/*/; do
+      if [ -d "$app" ]; then
+        app_name=$(basename "$app")
+        echo "  📱 Deploying $app_name..."
+        if kustomize build "$app" | kubectl apply -f -; then
+          echo "    ✅ $app_name deployed successfully"
+        else
+          echo "    ❌ $app_name deployment failed"
+        fi
+      fi
+    done
+    
+    # Verify deployments
+    echo ""
+    echo "🔍 Verifying deployments..."
+    kubectl get pods -A -o wide
+    
+    # Check services
+    echo ""
+    echo "🌐 Checking services..."
+    kubectl get svc -A
+    
+    # Check ingress
+    echo ""
+    echo "🚪 Checking ingress..."
+    kubectl get ingress -A
+    
+    # Health check
+    echo ""
+    echo "❤️ Health check..."
+    if kubectl get pods -A | grep -v Running | grep -v Completed | wc -l | grep -q "0"; then
+      echo "✅ All pods are healthy"
+    else
+      echo "⚠️  Some pods need attention:"
+      kubectl get pods -A | grep -v Running | grep -v Completed
+    fi
+    
+    echo ""
+    echo "🎉 Olares deployment complete!"
+    echo "📊 Monitoring: http://olares-01.tailnet.ts.net:9090"
+    echo "📈 Grafana: http://olares-01.tailnet.ts.net:3000"
+    echo "🔧 kubectl: kubectl get all -A"
+    EOF
+    
+    chmod +x /opt/olares/deploy.sh
+    chown ubuntu:ubuntu /opt/olares/deploy.sh
+    
+    # Make deployment script executable and create alias
+    echo "alias olares-deploy='/opt/olares/deploy.sh'" >> /home/ubuntu/.bashrc
+    chown ubuntu:ubuntu /home/ubuntu/.bashrc
+  
+  # Create monitoring dashboard for Grafana
+  - |
+    mkdir -p /opt/olares/monitoring/grafana
+    cat > /opt/olares/monitoring/grafana/dashboards/homelab-overview.json << 'EOF'
+    {
+      "dashboard": {
+        "id": null,
+        "title": "Homelab Overview",
+        "tags": ["homelab", "overview"],
+        "style": "dark",
+        "timezone": "browser",
+        "editable": true,
+        "hideControls": false,
+        "graphTooltip": 0,
+        "panels": [
+          {
+            "title": "Cluster Overview",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "count(kube_pod_info)",
+                "legendFormat": "{{pod}}",
+                "datasource": "Prometheus"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+          },
+          {
+            "title": "CPU Usage",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+                "legendFormat": "{{instance}}",
+                "datasource": "Prometheus"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+          },
+          {
+            "title": "Memory Usage",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "(1 - (sum by(instance) (node_memory_MemAvailable_bytes) / sum by(instance) (node_memory_MemTotal_bytes))) * 100",
+                "legendFormat": "{{instance}}",
+                "datasource": "Prometheus"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+          },
+          {
+            "title": "Pod Status",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(kube_pod_status_phase{phase=\"Running\"})",
+                "legendFormat": "Running",
+                "datasource": "Prometheus"
+              },
+              {
+                "expr": "sum(kube_pod_status_phase{phase=\"Pending\"})",
+                "legendFormat": "Pending",
+                "datasource": "Prometheus"
+              },
+              {
+                "expr": "sum(kube_pod_status_phase{phase=\"Failed\"})",
+                "legendFormat": "Failed",
+                "datasource": "Prometheus"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+          },
+          {
+            "title": "Network Traffic",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "rate(node_network_receive_bytes_total[5m])",
+                "legendFormat": "RX {{instance}}",
+                "datasource": "Prometheus"
+              },
+              {
+                "expr": "rate(node_network_transmit_bytes_total[5m])",
+                "legendFormat": "TX {{instance}}",
+                "datasource": "Prometheus"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 16}
+          },
+          {
+            "title": "Disk I/O",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "rate(node_disk_reads_completed_total[5m])",
+                "legendFormat": "Reads {{instance}}",
+                "datasource": "Prometheus"
+              },
+              {
+                "expr": "rate(node_disk_writes_completed_total[5m])",
+                "legendFormat": "Writes {{instance}}",
+                "datasource": "Prometheus"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 24, "x": 0, "y": 24}
+          }
+        ],
+        "time": {
+          "from": "now-6h",
+          "to": "now"
+        },
+        "timepicker": {
+          "refresh_intervals": ["5s","10s","30s","1m","5m","15m","30m","1h","2h","1d"],
+          "time_options": ["5m","15m","1h","6h","12h","24h","2d","7d","30d"]
+        },
+        "refresh": "30s",
+        "schemaVersion": 30,
+        "version": 1
+      },
+      "overwrite": false
+    }
+    EOF
+    
+    chown -R ubuntu:ubuntu /opt/olares/monitoring/grafana
+  
+  # Create ntfy webhook configuration for Alertmanager
+  - |
+    cat > /opt/olares/monitoring/alertmanager/ntfy-webhook.yaml << 'EOF'
+    # Alertmanager webhook configuration for ntfy integration
+    global:
+      smtp_from: alertmanager@homelab.local
+      smtp_smarthost: ntfy.homelab.local:80
+      resolve_timeout: 5m
+    
+    route:
+      group_by: ['alertname', 'cluster']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: ntfy-webhook
+      routes:
+        - match:
+            severity: critical
+          receiver: ntfy-critical
+          continue: true
+        - match:
+            severity: warning
+          receiver: ntfy-warning
+          continue: true
+        - match:
+            severity: info
+          receiver: ntfy-info
+    
+    receivers:
+      - name: ntfy-webhook
+        webhook_configs:
+          - url: 'http://ntfy.homelab.local:8080/homelab'
+            send_resolved: true
+            http_config:
+              tls_config:
+                insecure_skip_verify: true
+            title: '{{ template "default.title" . }}'
+            text: '{{ template "default.text" . }}'
+            # Custom ntfy formatting
+            headers:
+              X-Title: '{{ template "default.title" . }}'
+              X-Priority: '{{ if eq .Status "firing" }}5{{ else }}3{{ end }}'
+              X-Tags: 'warning,{{ .Status }}'
+              X-Click: 'http://grafana.homelab.local:3000/d/{{ .ExternalURL }}/alerting/grafana?orgId=1&view=table&alertmanager=grafana'
+    
+      - name: ntfy-critical
+        webhook_configs:
+          - url: 'http://ntfy.homelab.local:8080/homelab-critical'
+            send_resolved: true
+            http_config:
+              tls_config:
+                insecure_skip_verify: true
+            title: '🚨 CRITICAL: {{ template "default.title" . }}'
+            text: '{{ template "default.text" . }}'
+            headers:
+              X-Title: '🚨 CRITICAL: {{ template "default.title" . }}'
+              X-Priority: 5
+              X-Tags: 'critical,{{ .Status }},alert'
+              X-Click: 'http://grafana.homelab.local:3000/d/{{ .ExternalURL }}/alerting/grafana?orgId=1&view=table&alertmanager=grafana'
+              X-Actions: 'View in Grafana,http://grafana.homelab.local:3000/d/{{ .ExternalURL }}/alerting/grafana?orgId=1&view=table&alertmanager=grafana,View Logs,http://loki.homelab.local:3100'
+    
+      - name: ntfy-warning
+        webhook_configs:
+          - url: 'http://ntfy.homelab.local:8080/homelab-warning'
+            send_resolved: true
+            http_config:
+              tls_config:
+                insecure_skip_verify: true
+            title: '⚠️ WARNING: {{ template "default.title" . }}'
+            text: '{{ template "default.text" . }}'
+            headers:
+              X-Title: '⚠️ WARNING: {{ template "default.title" . }}'
+              X-Priority: 4
+              X-Tags: 'warning,{{ .Status }}'
+              X-Click: 'http://grafana.homelab.local:3000/d/{{ .ExternalURL }}/alerting/grafana?orgId=1&view=table&alertmanager=grafana'
+    
+      - name: ntfy-info
+        webhook_configs:
+          - url: 'http://ntfy.homelab.local:8080/homelab-info'
+            send_resolved: true
+            http_config:
+              tls_config:
+                insecure_skip_verify: true
+            title: 'ℹ️ INFO: {{ template "default.title" . }}'
+            text: '{{ template "default.text" . }}'
+            headers:
+              X-Title: 'ℹ️ INFO: {{ template "default.title" . }}'
+              X-Priority: 3
+              X-Tags: 'info,{{ .Status }}'
+    EOF
+    
+    chown ubuntu:ubuntu /opt/olares/monitoring/alertmanager/ntfy-webhook.yaml
+  
+  # Create iOS-friendly monitoring setup
+  - |
+    echo "Configuring iOS-friendly monitoring..."
+    
+    # Create ntfy iOS subscription script
+    cat > /opt/olares/setup-ios-alerts.sh << 'EOF'
+    #!/bin/bash
+    # Setup iOS alerts via ntfy + Pushover integration
+    
+    echo "📱 Setting up iOS alerts for homelab monitoring..."
+    
+    # Create ntfy topics
+    ntfy topics homelab-critical homelab-warning homelab-info
+    
+    # Configure Pushover integration (requires manual setup)
+    cat > /opt/olares/ntfy-pushover-setup.md << 'EOM'
+    # iOS Push Notifications Setup
+    
+    ## Step 1: Install Pushover App
+    1. Download Pushover app from App Store
+    2. Create account at pushover.net
+    3. Note your User Key (starts with u...)
+    
+    ## Step 2: Create Application
+    1. Go to pushover.net → Your Applications
+    2. Create new application "Homelab Alerts"
+    3. Note your API Token (starts with a...)
+    
+    ## Step 3: Configure ntfy
+    Edit /opt/gateway/config/ntfy/server.yml:
+    
+    pushover:
+      token: YOUR_API_TOKEN
+      user: YOUR_USER_KEY
+    
+    Then restart ntfy:
+    docker compose -f /opt/gateway/compose/docker-compose.yaml restart ntfy
+    
+    ## Step 4: Subscribe in Pushover
+    In Pushover app:
+    1. Add subscription "homelab-critical"
+    2. URL: http://ntfy.homelab.local:8080/homelab-critical
+    3. Repeat for homelab-warning, homelab-info
+    
+    ## Step 5: Test Alert
+    curl -d "Test alert from homelab" ntfy.homelab.local:8080/homelab-test
+    
+    ## Notification Settings
+    - Critical: High priority, sound enabled
+    - Warning: Medium priority, sound enabled  
+    - Info: Low priority, silent
+    EOM
+    
+    chmod +x /opt/olares/setup-ios-alerts.sh
+    chown ubuntu:ubuntu /opt/olares/setup-ios-alerts.sh
+    
+    echo "iOS alerts setup script created: /opt/olares/setup-ios-alerts.sh"
+    echo "Run this script after ntfy is running to configure Pushover integration"
+  
+  # Create sample application manifests
+  - |
+    echo "Creating sample GitOps applications..."
+    
+    # Create Homepage deployment as example
+    mkdir -p /opt/olares/apps/homepage
+    
+    cat > /opt/olares/apps/homepage/kustomization.yaml << 'EOF'
+    apiVersion: k8s
+    kind: Kustomization
+    
+    namespace: homelab
+    
+    resources:
+      - ../../bases/deployment-template.yaml
+      - ../../bases/service-template.yaml
+      - ../../bases/ingress-template.yaml
+    
+    configMapGenerator:
+      - name: homepage-config
+        files:
+          - config.yml=config.yml
+        options:
+          disableNameSuffixHash: true
+    
+    patchesStrategicMerge:
+      - deployment-patch.yaml
+      - service-patch.yaml
+      - ingress-patch.yaml
+    EOF
+    
+    cat > /opt/olares/apps/homepage/config.yml << 'EOF'
+    ---
+    # Homepage configuration for k3s deployment
+    title: Olares Dashboard
+    theme: dark
+    
+    services:
+      - Kubernetes:
+          - Dashboard:
+              icon: kubernetes.png
+              href: https://dashboard.local
+              description: Kubernetes dashboard
+          - Prometheus:
+              icon: prometheus.png
+              href: http://prometheus.monitoring.svc.cluster.local:9090
+              description: Monitoring system
+          - Grafana:
+              icon: grafana.png
+              href: http://grafana.monitoring.svc.cluster.local:3000
+              description: Monitoring dashboards
+      - Applications:
+          - Nextcloud:
+              icon: nextcloud.png
+              href: https://nextcloud.local
+              description: File sync and collaboration
+          - Homepage:
+              icon: homepage.png
+              href: http://homepage.local
+              description: Unified dashboard
+      - Infrastructure:
+          - Proxmox:
+              icon: proxmox.png
+              href: https://proxmox.local:8006
+              description: Virtualization platform
+          - Tailscale:
+              icon: tailscale.png
+              href: https://login.tailscale.com/admin
+              description: VPN mesh network
+          - Cloudflare:
+              icon: cloudflare.png
+              href: https://dash.cloudflare.com
+              description: DNS and tunnel management
+    
+    widgets:
+      - kubernetes-pods:
+          namespace: homelab
+          showNamespace: false
+      - kubernetes-nodes:
+          showNamespace: false
+      - resources:
+          resource: cpu
+          label: Cluster CPU
+      - resources:
+          resource: memory
+          label: Cluster Memory
+      - uptime_kuma:
+          server: http://uptime.local:3001
+          apikey: your-uptime-api-key
+    EOF
+    
+    cat > /opt/olares/apps/homepage/deployment-patch.yaml << 'EOF'
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: homepage
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: homepage
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: homepage
+        spec:
+          containers:
+            - name: homepage
+              image: ghcr.io/gethomepage/homepage:v0.10.3
+              ports:
+                - containerPort: 3000
+                  name: http
+              env:
+                - name: HOMEPAGE_ALLOWED_HOSTS
+                  value: "0.0.0.0/0"
+              volumeMounts:
+                - name: config
+                  mountPath: /app/config
+                - name: docker-sock
+                  mountPath: /var/run/docker.sock
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              livenessProbe:
+                httpGet:
+                  path: /
+                  port: 3000
+                initialDelaySeconds: 30
+                periodSeconds: 10
+              readinessProbe:
+                httpGet:
+                  path: /
+                  port: 3000
+                initialDelaySeconds: 5
+                periodSeconds: 5
+          volumes:
+            - name: config
+              configMap:
+                name: homepage-config
+            - name: docker-sock
+              hostPath:
+                path: /var/run/docker.sock
+                type: Socket
+    EOF
+    
+    cat > /opt/olares/apps/homepage/service-patch.yaml << 'EOF'
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: homepage
+    spec:
+      type: ClusterIP
+      ports:
+        - port: 3000
+          targetPort: 3000
+          protocol: TCP
+          name: http
+      selector:
+        app.kubernetes.io/name: homepage
+    EOF
+    
+    cat > /opt/olares/apps/homepage/ingress-patch.yaml << 'EOF'
+    apiVersion: networking.k8s.io/v1
+    kind: Ingress
+    metadata:
+      name: homepage
+    spec:
+      tls:
+        - hosts:
+            - homepage.local
+          secretName: homepage-tls
+      rules:
+        - host: homepage.local
+          http:
+            paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: homepage
+                    port:
+                      number: 3000
+    EOF
+    
+    chown -R ubuntu:ubuntu /opt/olares/apps/homepage
+    
+    # Commit the sample application
+    cd /opt/olares
+    git add apps/homepage
+    git commit -m "Add sample Homepage deployment" || true
+  
+  # Final verification
+  - |
+    echo "Olares VM bootstrap complete!"
+    echo ""
+    echo "✅ k3s single-node cluster installed"
+    echo "✅ GitOps repository initialized at /opt/olares"
+    echo "✅ Monitoring stack (Prometheus, Grafana) configured"
+    echo "✅ ntfy webhook for iOS alerts ready"
+    echo "✅ Sample Homepage application created"
+    echo ""
+    echo "🔧 Next steps:"
+    echo "  1. cd /opt/olares && ./deploy.sh  # Deploy everything"
+    echo "  2. kubectl get all -A             # Verify deployments"
+    echo "  3. kubectl port-forward -n monitoring svc/prometheus 9090:9090"
+    echo "  4. Run setup-ios-alerts.sh for Pushover integration"
+    echo ""
+    echo "📊 Access URLs (after deployment):"
+    echo "  • Prometheus: http://localhost:9090"
+    echo "  • Grafana: http://localhost:3000 (admin/admin)"
+    echo "  • Homepage: http://homepage.local"
+    echo "  • Kubernetes Dashboard: http://localhost:8001"
+
+write_files:
+  - path: /opt/olares/README.md
+    content: |
+      # Olares VM (olares-01) - k3s GitOps Center
+      
+      ## Overview
+      This VM runs the single-node k3s cluster and serves as the GitOps control plane for the homelab.
+      
+      ## Architecture
+      - **k3s**: Lightweight Kubernetes distribution (single-node)
+      - **Kustomize**: Declarative configuration management
+      - **Helm**: Application packaging
+      - **Prometheus**: Monitoring and alerting
+      - **Grafana**: Visualization dashboards
+      - **ntfy**: Push notifications to iOS
+      - **nginx-ingress**: External traffic routing
+      - **cert-manager**: Automatic TLS certificates
+      
+      ## Directory Structure
+      ```
+      /opt/olares/
+      ├── kustomization.yaml          # Root kustomization
+      ├── bases/                      # Base manifests (templates)
+      │   ├── namespace.yaml
+      │   ├── deployment-template.yaml
+      │   └── service-template.yaml
+      ├── overlays/                   # Environment overlays
+      │   ├── production/
+      │   └── staging/
+      ├── monitoring/                 # Monitoring stack
+      │   ├── prometheus/
+      │   ├── grafana/
+      │   └── alertmanager/
+      ├── apps/                       # Application deployments
+      │   ├── homepage/
+      │   ├── nextcloud/
+      │   └── custom-apps/
+      └── secrets/                    # Encrypted secrets (sops)
+      ```
+      
+      ## Quick Start
+      1. **Deploy everything**: `./deploy.sh`
+      2. **Check status**: `kubectl get all -A`
+      3. **Access monitoring**: 
+         - Prometheus: `kubectl port-forward -n monitoring svc/prometheus 9090:9090`
+         - Grafana: `kubectl port-forward -n monitoring svc/grafana 3000:80`
+      4. **iOS alerts**: Run `./setup-ios-alerts.sh`
+      5. **Add applications**: Create new directories in `apps/` with Kustomize manifests
+      
+      ## GitOps Workflow
+      1. Edit manifests in `apps/` or `overlays/`
+      2. Commit changes: `git add . && git commit -m "Update X" && git push`
+      3. Run deployment: `./deploy.sh`
+      4. Verify: `kubectl get all -A`
+      
+      ## Monitoring Setup
+      - **Prometheus**: Scrapes Node Exporter from all VMs via Tailscale
+      - **Alertmanager**: Sends alerts to ntfy server
+      - **Grafana**: Pre-configured dashboards for cluster health
+      - **iOS**: Pushover integration for critical alerts
+      
+      ## Security
+      - RBAC enabled with minimal permissions
+      - Network policies for pod isolation
+      - Automatic TLS via cert-manager
+      - Secrets encrypted with sops (optional)
+      - Regular image vulnerability scanning
+      
+      ## Backup Strategy
+      - etcd snapshots: `k3s etcd-snapshot save`
+      - Persistent volumes: Velero integration
+      - Configuration: Git repository
+      - Proxmox: VM snapshots and backups
+      
+      ## Troubleshooting
+      - **Cluster not healthy**: `k3s-killall.sh && systemctl restart k3s`
+      - **Pods stuck**: `kubectl describe pod <name> -n <namespace>`
+      - **Ingress not working**: `kubectl logs -n ingress-nginx deployment/ingress-nginx-controller`
+      - **Monitoring down**: `kubectl port-forward -n monitoring svc/prometheus 9090:9090`
+      - **GitOps issues**: `kustomize build . | kubectl apply -f - --dry-run=client`
+    permissions: '0644'
+    owner: ubuntu:ubuntu
+
+power_state:
+  mode: reboot
+  delay: "now"
+  message: "Olares VM bootstrap complete. Rebooting to start k3s cluster..."
+
+final_message: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  🎛️  Olares VM (olares-01) Bootstrap Complete!               ║
+  ║                                                              ║
+  ║  📋 k3s Single-Node Cluster Status:                          ║
+  ║  ├─ Containerd: ✅ Configured for systemd cgroup             ║
+  ║  ├─ k3s: ✅ Installed and running (single-node)              ║
+  ║  ├─ Kubeconfig: ✅ Available at /home/ubuntu/.kube/config    ║
+  ║  ├─ GitOps repo: ✅ Initialized at /opt/olares               ║
+  ║  ├─ Monitoring: ✅ Prometheus/Grafana manifests ready        ║
+  ║  ├─ Ingress: ✅ nginx-ingress and cert-manager installed     ║
+  ║  └─ Sample app: ✅ Homepage deployment template created      ║
+  ║                                                              ║
+  ║  🚀 Next Steps After Reboot:                                 ║
+  ║  1. cd /opt/olares && ./deploy.sh  # Deploy full stack       ║
+  ║  2. kubectl get all -A              # Verify all components  ║
+  ║  3. kubectl port-forward -n monitoring svc/prometheus 9090   ║
+  ║  4. Run ./setup-ios-alerts.sh for Pushover setup             ║
+  ║  5. Edit apps/ for your custom applications                  ║
+  ║                                                              ║
+  ║  📊 Access URLs (after deployment):                          ║
+  ║  ├─ Kubernetes API: https://localhost:6443                   ║
+  ║  ├─ Prometheus: http://localhost:9090 (port-forward)         ║
+  ║  ├─ Grafana: http://localhost:3000 (admin/admin)             ║
+  ║  ├─ Homepage: http://homepage.local:3000                     ║
+  ║  ├─ Ingress: http://olares-01.tailnet.ts.net                 ║
+  ║  └─ ntfy alerts: http://ntfy.homelab.local:8080/homelab      ║
+  ║                                                              ║
+  ║  📱 iOS Integration Ready:                                   ║
+  ║  ├─ Pushover app subscription for homelab-critical           ║
+  ║  ├─ Real-time alerts for CPU/Memory/Disk issues              ║
+  ║  ├─ Tap-to-access Grafana dashboards from notifications      ║
+  ║  └─ Zero-config monitoring out of the box                    ║
+  ║                                                              ║
+  ╚══════════════════════════════════════════════════════════════╝

@@ -1,0 +1,24 @@
+{
+  "name": "homelab-deploy",
+  "version": "1.0.0",
+  "description": "Pulumi infrastructure for VM-centric homelab on Proxmox 9",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "pulumi": "pulumi",
+    "install-deps": "npm install"
+  },
+  "dependencies": {
+    "@pulumi/pulumi": "^3.118.0",
+    "@pulumi/proxmox": "^0.4.0",
+    "@types/node": "^20.11.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "@types/fs": "^0.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

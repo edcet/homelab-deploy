@@ -1,0 +1,148 @@
+version: "3.8"
+
+# Podman Compose for Gerbil - Adapted from flarescalin/charts/gerbil/templates
+# Tunneling and relay service
+
+name: gerbil-gateway
+
+x-podman: &podman-common
+  security_opt:
+    - no-new-privileges:true
+  cap_add:
+    - NET_BIND_SERVICE
+    - NET_ADMIN  # Required for tunneling
+  cap_drop:
+    - ALL
+  read_only: false
+  tmpfs:
+    - /tmp
+    - /run
+  sysctls:
+    - net.ipv4.ip_unprivileged_port_start=80
+    - net.ipv4.ip_forward=1
+  labels:
+    io.podman.compose.project: gerbil-gateway
+    io.podman.compose.version: "0.1"
+
+x-logging: &default-logging
+  driver: journald
+  options:
+    tag: "{{.Name}}"
+    mode: non-blocking
+    max-file: "5"
+    max-size: "10m"
+
+networks:
+  gerbil-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.2.0/24
+          gateway: 172.30.2.1
+    enable_ipv6: false
+  gateway-net:
+    external: true
+  tailscale-net:
+    external: true
+
+volumes:
+  gerbil-config:
+    driver: local
+  gerbil-data:
+    driver: local
+
+services:
+  gerbil:
+    <<: *podman-common
+    image: fosrl/gerbil:latest
+    container_name: gerbil
+    restart: always
+    ports:
+      - "2222:2222"  # SSH tunnel
+      - "8443:8443"  # HTTPS tunnel
+      - "1138:1138"  # Gerbil control port
+    volumes:
+      - gerbil-config:/app/config
+      - gerbil-data:/data
+      - /var/run/podman/podman.sock:/var/run/podman.sock:ro
+      - /opt/gateway/ssl:/ssl:ro
+    environment:
+      - TZ=${TZ}
+      - GERBIL_PORT_SSH=2222
+      - GERBIL_PORT_HTTPS=8443
+      - GERBIL_CONTROL_PORT=1138
+      - GERBIL_LOG_LEVEL=INFO
+      # From flarescalin values (adapt as needed)
+      - GERBIL_REPLICA_COUNT=1
+      - GERBIL_IMAGE_REPOSITORY=fosrl/gerbil
+      - GERBIL_IMAGE_TAG=latest
+      - GERBIL_IMAGE_PULL_POLICY=IfNotPresent
+      # Upstream connections (adapt from k8s service)
+      - GERBIL_UPSTREAM_SSH=localhost:22
+      - GERBIL_UPSTREAM_HTTPS=traefik:443
+      - GERBIL_UPSTREAM_CONTROL=pangolin:3001
+      # Authentication (configure as needed)
+      - GERBIL_AUTH_METHOD=password
+      - GERBIL_AUTH_USER=gerbil
+      - GERBIL_AUTH_PASSWORD=SecureGerbilPass2024!
+      # Tailscale integration for secure tunneling
+      - GERBIL_TAILSCALE_ENABLED=true
+      - GERBIL_TAILSCALE_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - GERBIL_TAILSCALE_INTERFACE=tailscale0
+      # Dynamic configuration path
+      - GERBIL_DYNAMIC_PATH=/data/dynamic
+      # Relay targets
+      - GERBIL_RELAY_SSH=localhost:22
+      - GERBIL_RELAY_HTTPS=pangolin:3001
+      - GERBIL_RELAY_METRICS=prometheus:9090
+    networks:
+      - gerbil-net
+      - gateway-net
+      - tailscale-net
+    labels:
+      # Service discovery labels (adapted from k8s labels)
+      - "app.kubernetes.io/name=gerbil"
+      - "app.kubernetes.io/instance=gerbil"
+      - "cf.expose=true"
+      - "homepage.group=Networking"
+      - "homepage.name=Gerbil"
+      - "homepage.icon=gerbil.png"
+      - "homepage.href=ssh://gerbil.local:2222"
+      - "homepage.description=Secure tunneling and relay service"
+      # Traefik routing for admin interface
+      - "traefik.enable=true"
+      - "traefik.http.routers.gerbil.rule=Host(`gerbil.local`)"
+      - "traefik.http.routers.gerbil.entrypoints=websecure"
+      - "traefik.http.services.gerbil.loadbalancer.server.port=8443"
+      # Security - admin interface only
+      - "traefik.http.middlewares.gerbil-admin.basicauth.users=gerbil-admin:$$2y$$05$$YOUR_GERBIL_HASH"
+      - "traefik.http.routers.gerbil.middlewares=gerbil-admin"
+      # Health check (adapted from readinessProbe)
+      - "traefik.http.routers.gerbil-health.rule=Host(`gerbil.local`) && PathPrefix(`/health`)"
+      - "traefik.http.services.gerbil-health.loadbalancer.server.port=1138"
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2222 && nc -z localhost 8443 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      # Adapted from k8s readinessProbe initialDelaySeconds: 5, periodSeconds: 10
+
+  # ConfigMap equivalent - Podman config volume for gerbil
+  gerbil-config:
+    <<: *podman-common
+    image: busybox:1.36
+    container_name: gerbil-config-init
+    restart: "no"
+    command: ["sh", "-c", "echo 'data: {}' > /app/config/config.yml && chmod 644 /app/config/config.yml"]
+    volumes:
+      - gerbil-config:/app/config
+    networks:
+      - gerbil-net
+
+# Note: PersistentVolumeClaim (gerbil-data) is handled as named volume in Podman
+# No separate PVC configuration like in k8s
+
+# Service equivalent - Exposed via ports above
+# No separate service resource needed in Podman Compose

@@ -1,0 +1,102 @@
+version: '3.8'
+
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro  # For Podman, use podman.sock if needed
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./acme.json:/acme.json
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik.service=api@internal"
+      - "traefik.http.routers.traefik.tls.certresolver=letsencrypt"
+    environment:
+      - CF_DNS_API_TOKEN=${CF_TOKEN}
+
+  homepage:
+    image: ghcr.io/gethomepage/homepage:latest
+    container_name: homepage
+    restart: unless-stopped
+    volumes:
+      - ./config:/app/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.homepage.rule=Host(`homepage.${DOMAIN}`)"
+      - "traefik.http.routers.homepage.tls.certresolver=letsencrypt"
+      - "traefik.http.services.homepage.loadbalancer.server.port=3000"
+      - "io.tailscale.service=homepage"  # Custom label for watcher/Tailscale
+
+  glance:
+    image: glance:latest  # Assume image for Glance media server
+    container_name: glance
+    restart: unless-stopped
+    volumes:
+      - ./glance/data:/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.glance.rule=Host(`glance.${DOMAIN}`)"
+      - "traefik.http.routers.glance.tls.certresolver=letsencrypt"
+      - "traefik.http.services.glance.loadbalancer.server.port=8080"
+      - "io.cloudflared.tunnel=glance"  # For Cloudflared integration via watcher
+
+  casaos:
+    image: casaos:latest
+    container_name: casaos
+    restart: unless-stopped
+    ports:
+      - "80:80"  # Internal, routed via Traefik
+    volumes:
+      - ./casaos/data:/DATA
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.casaos.rule=Host(`casaos.${DOMAIN}`)"
+      - "traefik.http.routers.casaos.tls.certresolver=letsencrypt"
+      - "traefik.http.services.casaos.loadbalancer.server.port=80"
+      - "io.tailscale.service=casaos"  # iOS-friendly access
+
+  dokploy:
+    image: dokploy/dokploy:latest
+    container_name: dokploy
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./dokploy/data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - MONGODB_URI=mongodb://mongo:27017/dokploy
+      - JWT_SECRET=${JWT_SECRET}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dokploy.rule=Host(`dokploy.${DOMAIN}`)"
+      - "traefik.http.routers.dokploy.tls.certresolver=letsencrypt"
+      - "traefik.http.services.dokploy.loadbalancer.server.port=3000"
+      - "io.tailscale.service=dokploy"  # iOS deployment tool
+
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    restart: unless-stopped
+    volumes:
+      - ./mongo/data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USER}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASS}
+
+volumes:
+  mongo_data:
+
+networks:
+  default:
+    name: homelab
+    external: true

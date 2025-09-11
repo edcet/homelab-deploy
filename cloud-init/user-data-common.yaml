@@ -1,0 +1,453 @@
+#cloud-config
+# Common configuration for all homelab VMs
+# This template provides baseline setup for all VMs including monitoring
+
+hostname: "{{.VM_NAME}}"
+manage_etc_hosts: true
+preserve_hostname: false
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... user@homelab  # Replace with your SSH public key
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... github-actions@homelab  # For CI/CD access
+
+groups:
+  - docker
+  - podman
+  - sudo
+  - kvm
+
+packages:
+  - curl
+  - wget
+  - htop
+  - vim
+  - git
+  - ufw
+  - ca-certificates
+  - software-properties-common
+  - apt-transport-https
+  - lsb-release
+  - gnupg
+  - net-tools
+  - jq
+  - yq
+  - tree
+  - unzip
+  - rsync
+  - chrony
+
+package_upgrade: true
+package_reboot_if_required: true
+package_update: true
+
+# Firewall configuration - secure by default
+ufw:
+  configure: true
+  allow:
+    - 22/tcp   # SSH
+    - 80/tcp   # HTTP
+    - 443/tcp  # HTTPS
+    - 53/udp   # DNS (Tailscale)
+    - 41641/udp # Tailscale
+    - 9100/tcp # Node Exporter
+    - 3000/tcp # Homepage
+    - 8787/tcp # Glance
+    - 8000/tcp # CasaOS
+    - 8080/tcp # Generic services
+  deny: incoming
+  enabled: true
+  logging: "on"
+
+# Systemd configuration
+systemd:
+  units:
+    - name: node-exporter.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Prometheus Node Exporter
+        Documentation=https://prometheus.io/docs/guides/node-exporter/
+        Wants=network-online.target
+        After=network-online.target
+        
+        [Service]
+        User=node_exporter
+        Group=node_exporter
+        Type=simple
+        ExecStart=/usr/local/bin/node_exporter \\
+          --path.rootfs=/host \\
+          --collector.filesystem.ignored-mount-points="^/(sys|proc|dev|host|etc)($$|/)" \\
+          --collector.tcpstat.all \\
+          --collector.filesystem.mount-points-exclude="^/(sys|proc|dev|host|etc|var/lib/docker/.+|var/lib/kubelet/.+)($$|/)" \\
+          --web.listen-address=:9100 \\
+          --log.level=info \\
+          --log.format=logger:stderr
+        Restart=always
+        RestartSec=5
+        LimitNOFILE=65536
+        ReadWritePaths=/var/lib/node_exporter
+        ProtectSystem=strict
+        NoNewPrivileges=true
+        PrivateTmp=true
+        PrivateDevices=true
+        ProtectHome=true
+        ProtectKernelTunables=true
+        ProtectKernelModules=true
+        ProtectControlGroups=true
+        
+        [Install]
+        WantedBy=multi-user.target
+
+runcmd:
+  # System updates and optimization
+  - apt-get update -qq >/dev/null 2>&1
+  - apt-get upgrade -y -qq >/dev/null 2>&1
+  - apt-get autoremove -y -qq >/dev/null 2>&1
+  - apt-get clean >/dev/null 2>&1
+  
+  # Install Node Exporter for monitoring
+  - |
+    if ! command -v node_exporter >/dev/null 2>&1; then
+      echo "Installing Prometheus Node Exporter..."
+      cd /tmp
+      wget -q --show-progress --progress=bar:force:noscroll "https://github.com/prometheus/node_exporter/releases/download/v1.8.2/node_exporter-1.8.2.linux-amd64.tar.gz"
+      tar xvfz node_exporter-1.8.2.linux-amd64.tar.gz
+      mv node_exporter-1.8.2.linux-amd64/node_exporter /usr/local/bin/
+      rm -rf node_exporter-1.8.2.linux-amd64*
+      useradd --no-create-home --shell /bin/false --system node_exporter || true
+      mkdir -p /var/lib/node_exporter
+      chown node_exporter:node_exporter /var/lib/node_exporter
+      systemctl daemon-reload
+      systemctl enable node-exporter
+      systemctl start node-exporter
+      echo "Node Exporter installed and started on port 9100"
+    else
+      echo "Node Exporter already installed"
+    fi
+  
+  # Configure firewall
+  - ufw --force enable
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp comment "SSH from anywhere"
+  - ufw allow 80/tcp comment "HTTP from anywhere"
+  - ufw allow 443/tcp comment "HTTPS from anywhere"
+  - ufw allow 53/udp comment "DNS (Tailscale)"
+  - ufw allow 41641/udp comment "Tailscale"
+  - ufw allow 9100/tcp comment "Node Exporter (monitoring)"
+  - ufw allow 3000/tcp comment "Homepage dashboard"
+  - ufw allow 8787/tcp comment "Glance media dashboard"
+  - ufw allow 8000/tcp comment "CasaOS app store"
+  - ufw allow 8080/tcp comment "Generic application services"
+  - ufw --reload
+  - systemctl restart ufw
+  
+  # User group memberships
+  - usermod -aG docker ubuntu 2>/dev/null || true
+  - usermod -aG podman ubuntu 2>/dev/null || true
+  - usermod -aG kvm ubuntu 2>/dev/null || true
+  - newgrp docker >/dev/null 2>&1 || true
+  
+  # Create standard directory structure
+  - |
+    mkdir -p /opt/{homelab,gateway,olares,cosmos,yunohost,monitoring,backups,media}
+    mkdir -p /var/log/{homelab,applications,monitoring,containers}
+    mkdir -p /var/lib/{docker,podman,containers}
+    chown -R ubuntu:ubuntu /opt/{homelab,gateway,olares,cosmos,yunohost,monitoring}
+    chmod 755 /opt/{homelab,gateway,olares,cosmos,yunohost,monitoring}
+  
+  # System optimization
+  - |
+    cat >> /etc/sysctl.conf << EOF
+    # Homelab optimizations
+    vm.swappiness = 10
+    vm.vfs_cache_pressure = 50
+    vm.dirty_ratio = 15
+    vm.dirty_background_ratio = 5
+    fs.file-max = 65536
+    kernel.threads-max = 65536
+    net.core.somaxconn = 65535
+    net.ipv4.tcp_max_syn_backlog = 65535
+    net.ipv4.tcp_tw_reuse = 1
+    net.ipv4.ip_forward = 1
+    net.ipv4.conf.all.rp_filter = 0
+    net.ipv4.conf.default.rp_filter = 0
+    EOF
+    sysctl -p
+    sysctl --system
+  
+  # Configure chrony for better time sync (important for certificates)
+  - |
+    cat >> /etc/chrony/chrony.conf << EOF
+    # Homelab time sources
+    pool 0.debian.pool.ntp.org iburst
+    pool 1.debian.pool.ntp.org iburst
+    pool 2.debian.pool.ntp.org iburst
+    pool 3.debian.pool.ntp.org iburst
+    pool time.cloudflare.com iburst
+    pool time.google.com iburst
+    
+    # Allow NTP queries
+    allow 100.64.0.0/10  # Tailscale subnet
+    allow 192.168.0.0/16  # Local subnet
+    
+    # Local stratum 1 server (if you have one)
+    # server 192.168.1.10 iburst
+    EOF
+    systemctl restart chrony
+    systemctl enable chrony
+  
+  # Create swap file (2GB) for memory-constrained VMs
+  - |
+    if [ ! -f /swapfile ]; then
+      echo "Creating 2GB swap file..."
+      fallocate -l 2G /swapfile
+      chmod 600 /swapfile
+      mkswap /swapfile
+      swapon /swapfile
+      echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
+
+write_files:
+  - path: /etc/systemd/system/node-exporter.service
+    content: |
+      [Unit]
+      Description=Prometheus Node Exporter
+      Documentation=https://prometheus.io/docs/guides/node-exporter/
+      Wants=network-online.target
+      After=network-online.target
+      StartLimitIntervalSec=0
+      
+      [Service]
+      User=node_exporter
+      Group=node_exporter
+      Type=simple
+      ExecStart=/usr/local/bin/node_exporter \\
+        --path.rootfs=/host \\
+        --collector.filesystem.ignored-mount-points="^/(sys|proc|dev|host|etc|var/lib/docker/.+|var/lib/kubelet/.+)($$|/)" \\
+        --collector.tcpstat.all \\
+        --collector.filesystem.mount-points-exclude="^/(sys|proc|dev|host|etc|var/lib/docker/.+|var/lib/kubelet/.+)($$|/)" \\
+        --web.listen-address=:9100 \\
+        --log.level=info \\
+        --log.format=logger:stderr \\
+        --collector.systemd
+      Restart=always
+      RestartSec=5
+      LimitNOFILE=65536
+      ReadWritePaths=/var/lib/node_exporter
+      ProtectSystem=strict
+      NoNewPrivileges=true
+      PrivateTmp=true
+      PrivateDevices=true
+      ProtectHome=true
+      ProtectKernelTunables=true
+      ProtectKernelModules=true
+      ProtectControlGroups=true
+      MemoryAccounting=true
+      CPUAccounting=true
+      PrivateIPC=true
+      PrivateNetwork=false
+      
+      [Install]
+      WantedBy=multi-user.target
+    permissions: '0644'
+    owner: root:root
+
+  - path: /etc/motd
+    content: |
+      ╔══════════════════════════════════════════════════════════════╗
+      ║  🏠 Welcome to Homelab VM - $(hostname)                       ║
+      ║  ┌──────────────────────────────────────────────────────────┐ ║
+      ║  │ Architecture: $(uname -m)                                │ ║
+      ║  │ Uptime: $(uptime -p)                                     │ ║
+      ║  │ Memory: $(free -h | awk 'NR==2{printf "%.1f/%.1fGB", $3/1024, $2/1024}') │ ║
+      ║  │ Disk: $(df -h / | awk 'NR==2{printf "%.1f/%.1fGB", $3/1024, $2/1024}')   │ ║
+      ║  │ CPU: $(nproc) cores                                      │ ║
+      ║  │ Load: $(uptime | awk -F'load average:' '{print $2}' | sed 's/,//g') │ ║
+      ║  └──────────────────────────────────────────────────────────┘ ║
+      ║                                                              ║
+      ║  🔗 Network Status:                                          ║
+      ║  │ Tailscale: $(tailscale status --json 2>/dev/null | jq -r '.Self.TailscaleIPs[0] // "Not connected"' || echo "Not running") │ ║
+      ║  │ Local IP: $(hostname -I | awk '{print $1}')              │ ║
+      ║  │ Public IP: $(curl -s --connect-timeout 5 ifconfig.me || echo "Unknown") │ ║
+      ║                                                              ║
+      ║  🛡️  Services Status:                                        ║
+      ║  │ Docker: $(systemctl is-active --quiet docker 2>/dev/null && echo "🟢 Active" || echo "🔴 Not installed") │ ║
+      ║  │ Podman: $(podman --version 2>/dev/null | head -n1 || echo "🔴 Not installed") │ ║
+      ║  │ Node Exporter: $(systemctl is-active --quiet node-exporter 2>/dev/null && echo "🟢 Active (port 9100)" || echo "🟡 Starting") │ ║
+      ║  │ Firewall: $(ufw status | head -n1 || echo "🔴 UFW disabled") │ ║
+      ║                                                              ║
+      ║  📱 Access Methods:                                          ║
+      ║  │ • Tailscale MagicDNS: {{.VM_NAME}}.tailnet.ts.net         ║
+      ║  │ • Cloudflared Subdomains: {{.VM_NAME}}.example.com        ║
+      ║  │ • SSH: ubuntu@{{.VM_NAME}} (passwordless via keys)        ║
+      ║  │ • Monitoring: http://{{.VM_NAME}}:9100/metrics            ║
+      ║                                                              ║
+      ║  ⚠️  Quick Commands:                                         ║
+      ║  │ $ tailscale status                    # Mesh connectivity │ ║
+      ║  │ $ tailscale ping olares-01            # Test tailnet      │ ║
+      ║  │ $ docker ps                           # Container status  │ ║
+      ║  │ $ podman ps                           # Podman containers │ ║
+      ║  │ $ curl localhost:9100/metrics         # Node exporter     │ ║
+      ║  │ $ ufw status verbose                  # Firewall rules    │ ║
+      ║                                                              ║
+      ║  🎯 VM Role: {{.VM_ROLE}}                                     ║
+      ║                                                              ║
+      ╚══════════════════════════════════════════════════════════════╝
+    permissions: '0644'
+    owner: root:root
+
+  - path: /etc/profile.d/homelab-aliases.sh
+    content: |
+      # Homelab-specific aliases and functions
+      # Loaded for all users
+      
+      # Basic aliases
+      alias ll='ls -alFh'
+      alias la='ls -A'
+      alias l='ls -CF'
+      alias grep='grep --color=auto'
+      alias ..='cd ..'
+      alias ...='cd ../..'
+      alias ....='cd ../../..'
+      alias df='df -h'
+      alias du='du -ch'
+      alias ps='ps auxf'
+      alias ping='ping -c 5'
+      
+      # Homelab-specific aliases
+      alias ts-status='tailscale status'
+      alias ts-ping='tailscale ping'
+      alias ts-ip='tailscale ip -4'
+      alias ts-logout='tailscale logout'
+      alias ts-debug='tailscale debug'
+      alias docker-ps='docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}\\n"'
+      alias podman-ps='podman ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}\\n"'
+      alias logs='journalctl -f -u'
+      alias health='systemctl --failed'
+      alias services='systemctl list-units --type=service --state=running'
+      alias failed='systemctl --failed'
+      
+      # Monitoring aliases
+      alias metrics='curl -s localhost:9100/metrics | grep -E "^(node_|go_)" | head -20'
+      alias node-info='curl -s localhost:9100/metrics | grep -E "^node_.*{instance=\\"localhost:9100\\"}" | head -10'
+      alias memory='free -h'
+      alias disk='df -h /'
+      alias cpu='top -bn1 | head -15'
+      
+      # Network utilities
+      alias myip='curl -s ifconfig.me'
+      alias localip='hostname -I | awk "{print \$1}"'
+      alias tailnet='tailscale ip -4'
+      alias ports='ss -tulpn | grep LISTEN'
+      alias connections='ss -tulpn'
+      
+      # Docker/Podman utilities
+      alias dlogs='docker logs -f'
+      alias dclean='docker system prune -f'
+      alias dimages='docker images -a'
+      alias pstop='podman stop $(podman ps -q)'
+      alias pclean='podman container prune -f'
+      
+      # GitOps aliases
+      alias git-pull='git pull origin main'
+      alias git-push='git push origin main'
+      alias kustomize='kustomize build .'
+      
+      # System utilities
+      alias reboot-safe='sync && echo 3 > /proc/sys/kernel/sysrq && echo b > /proc/sysrq-trigger'
+      alias update='apt-get update && apt-get upgrade -y && apt-get autoremove -y'
+      
+      # Export useful variables
+      if command -v tailscale >/dev/null 2>&1; then
+        export TAILNET=$(tailscale ip -4 2>/dev/null || echo "")
+        export TAILNET_NAME=$(hostname)
+      fi
+      
+      export LOCAL_IP=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "")
+      export HOMELAB_DIR=/opt/homelab
+      export DOCKER_DIR=/var/lib/docker
+      export PODMAN_DIR=/var/lib/podman
+      
+      # Functions
+      homelab-status() {
+        echo "=== Homelab Status for $(hostname) ==="
+        echo "Tailscale: $(tailscale status 2>/dev/null | head -1 || echo 'Not connected')"
+        echo "Docker: $(systemctl is-active docker 2>/dev/null || echo 'Not installed')"
+        echo "Podman: $(podman --version 2>/dev/null | head -n1 || echo 'Not installed')"
+        echo "UFW: $(ufw status | head -n1 || echo 'Disabled')"
+        echo "Node Exporter: $(systemctl is-active node-exporter 2>/dev/null && echo 'Active' || echo 'Not running')"
+        echo "Memory: $(free -h | awk 'NR==2{printf "%.1fG / %.1fG", $3/1024, $2/1024}')"
+        echo "Disk: $(df -h / | awk 'NR==2{printf "%.1fG / %.1fG", $3/1024, $2/1024}')"
+        echo "Load: $(uptime | awk -F'load average:' '{print $2}')"
+      }
+      
+      # Add to PATH
+      export PATH=$PATH:/usr/local/bin:/opt/homebrew/bin
+      
+      # Colors for ls
+      if [ -x /usr/bin/dircolors ]; then
+        test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+        alias ls='ls --color=auto'
+      fi
+    permissions: '0644'
+    owner: root:root
+
+  - path: /etc/cron.d/homelab-maintenance
+    content: |
+      # Homelab maintenance tasks
+      # Run daily at 2:30 AM
+      
+      30 2 * * * root /usr/bin/apt-get update -qq >/dev/null 2>&1 && /usr/bin/apt-get upgrade -y -qq >/dev/null 2>&1 && /usr/bin/apt-get autoremove -y -qq >/dev/null 2>&1
+      0 3 * * * root /usr/bin/docker system prune -f >/dev/null 2>&1 || true
+      0 4 1 * * root /usr/bin/find /var/log -type f -name "*.log" -mtime +7 -delete 2>/dev/null || true
+      @reboot root /usr/bin/systemctl restart node-exporter >/dev/null 2>&1
+      
+      # Weekly ZFS snapshot (if applicable)
+      # 0 5 * * 0 root zfs snapshot -r tank@weekly-$(date +%Y%m%d) >/dev/null 2>&1 || true
+    permissions: '0644'
+    owner: root:root
+
+# Power management
+power_state:
+  mode: reboot
+  delay: "now"
+  message: "Homelab VM bootstrap complete. Rebooting to apply all configurations and optimizations..."
+
+# Final message displayed to user after successful provisioning
+final_message: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  ✅ Homelab VM Bootstrap Complete - $(hostname)              ║
+  ║  ═══════════════════════════════════════════════════════════ ║
+  ║                                                              ║
+  ║  📋 Configuration Summary:                                   ║
+  ║  ├─ System fully updated and optimized                       ║
+  ║  ├─ UFW firewall enabled with secure defaults                ║
+  ║  ├─ Prometheus Node Exporter installed (port 9100)           ║
+  ║  ├─ SSH keys configured, passwordless sudo enabled           ║
+  ║  ├─ Docker/Podman groups configured                          ║
+  ║  ├─ Standard directories created (/opt/homelab, etc.)        ║
+  ║  ├─ System aliases and PATH updated                          ║
+  ║  ├─ Chrony time sync configured                              ║
+  ║  ├─ 2GB swap file created                                    ║
+  ║  └─ Maintenance cron jobs scheduled                          ║
+  ║                                                              ║
+  ║  🔄 The system will now reboot to apply all configurations   ║
+  ║  and ensure all services start properly.                     ║
+  ║                                                              ║
+  ║  🏠 After reboot, connect via:                               ║
+  ║  ├─ SSH: ubuntu@{{.VM_NAME}} (passwordless)                  ║
+  ║  ├─ Tailscale: {{.VM_NAME}}.tailnet.ts.net                   ║
+  ║  └─ Monitoring: http://{{.VM_NAME}}:9100/metrics             ║
+  ║                                                              ║
+  ║  📱 Quick start command:                                     ║
+  ║  ├─ $ homelab-status   # Check system health                 ║
+  ║  ├─ $ tailscale status # Verify mesh connectivity            ║
+  ║  └─ $ ufw status       # Verify firewall rules               ║
+  ║                                                              ║
+  ╚══════════════════════════════════════════════════════════════╝

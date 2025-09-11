@@ -1,0 +1,119 @@
+name: Homelab Deploy
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
+  PROXMOX_ENDPOINT: ${{ secrets.PROXMOX_ENDPOINT }}
+  PROXMOX_USERNAME: ${{ secrets.PROXMOX_USERNAME }}
+  PROXMOX_PASSWORD: ${{ secrets.PROXMOX_PASSWORD }}
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+  CF_TOKEN: ${{ secrets.CF_TOKEN }}
+  GW_SSH_HOST: ${{ secrets.GW_SSH_HOST }}
+  GW_SSH_USER: ${{ secrets.GW_SSH_USER }}
+  GW_SSH_KEY: ${{ secrets.GW_SSH_KEY }}
+
+jobs:
+  deploy-infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Pulumi CLI
+        uses: pulumi/actions@v5
+        with:
+          version: latest
+
+      - name: Configure Pulumi
+        run: |
+          pulumi config set proxmox:endpoint ${{ env.PROXMOX_ENDPOINT }} --secret
+          pulumi config set proxmox:username ${{ env.PROXMOX_USERNAME }} --secret
+          pulumi config set proxmox:password ${{ env.PROXMOX_PASSWORD }} --secret
+          pulumi config set proxmox:insecure true
+          pulumi config set tailscale:authKey ${{ env.TAILSCALE_AUTHKEY }} --secret
+
+      - name: Deploy Infrastructure (Pulumi)
+        run: |
+          cd homelab-deploy/pulumi
+          pulumi up --yes --stack dev --non-interactive
+
+  deploy-gateway:
+    needs: deploy-infra
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ env.GW_SSH_KEY }}
+
+      - name: Deploy to Gateway VM
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ env.GW_SSH_USER }}@${{ env.GW_SSH_HOST }} "
+            # Copy files
+            mkdir -p /opt/homelab/gateway/{compose,scripts,systemd}
+            scp -o StrictHostKeyChecking=no ../homelab-deploy/gateway/compose/* /opt/homelab/gateway/compose/
+            scp -o StrictHostKeyChecking=no ../homelab-deploy/gateway/scripts/* /opt/homelab/gateway/scripts/
+            scp -o StrictHostKeyChecking=no ../homelab-deploy/gateway/systemd/* /opt/homelab/gateway/systemd/
+
+            # Setup environment
+            cd /opt/homelab/gateway
+            echo 'CF_TOKEN=${{ env.CF_TOKEN }}' > .env
+            echo 'DOMAIN=rns.lol' >> .env
+            echo 'TS_AUTHKEY=${{ env.TAILSCALE_AUTHKEY }}' >> .env
+            chmod 600 .env
+
+            # Enable systemd services
+            systemctl daemon-reload
+            systemctl enable watcher.service
+            systemctl start watcher.service
+
+            # Deploy Podman compose
+            podman-compose -f compose/compose.yaml up -d
+
+            # Health check
+            podman ps
+          "
+
+  deploy-kustomize:
+    needs: deploy-infra
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH for Olares
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.OLARES_SSH_KEY }}
+
+      - name: Deploy Kustomize to Olares
+        run: |
+          ssh -o StrictHostKeyChecking=no ubuntu@olares-01.homelab.local "
+            # Install kustomize if not present
+            if ! command -v kustomize >/dev/null 2>&1; then
+              curl -s 'https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh' | bash
+              sudo mv kustomize /usr/local/bin/
+            fi
+
+            # Copy kustomize files
+            mkdir -p /opt/olares/monitoring
+            scp -o StrictHostKeyChecking=no ../homelab-deploy/kustomize/olares/monitoring/* /opt/olares/monitoring/
+
+            # Apply kustomize
+            cd /opt/olares/monitoring
+            kustomize build . | kubectl apply -f -
+
+            # Verify
+            kubectl get pods -n monitoring
+          "

@@ -1,0 +1,82 @@
+name: homelab-deploy
+runtime:
+  name: nodejs
+  options:
+    nodeVersion: 18.x
+
+description: VM-centric homelab infrastructure on Proxmox 9 (R240)
+
+configuration:
+  proxmox:
+    endpoint:
+      type: string
+      default: https://your-proxmox.local:8006
+    username:
+      type: string
+      default: root@pam
+    password:
+      type: string
+      secret: true
+    node:
+      type: string
+      default: r240
+    insecure:
+      type: boolean
+      default: true  # Set to false for production with valid certs
+  
+  tailscale:
+    authKey:
+      type: string
+      secret: true
+      description: Ephemeral Tailscale auth key for VM joining
+  
+  cloudflare:
+    apiToken:
+      type: string
+      secret: true
+      description: Cloudflare API token for DNS management
+  
+  vms:
+    gw:
+      cpu: 
+        type: number
+        default: 2
+      memory:
+        type: number
+        default: 4096  # MB
+      diskSize:
+        type: number
+        default: 50   # GB
+    olares:
+      cpu:
+        type: number
+        default: 4
+      memory:
+        type: number
+        default: 8192
+      diskSize:
+        type: number
+        default: 100
+    cosmos:
+      cpu:
+        type: number
+        default: 4
+      memory:
+        type: number
+        default: 8192
+      diskSize:
+        type: number
+        default: 200
+    ynh:
+      cpu:
+        type: number
+        default: 4
+      memory:
+        type: number
+        default: 8192
+      diskSize:
+        type: number
+        default: 300
+
+# Enable preview to avoid destroying resources during testing
+preview: true

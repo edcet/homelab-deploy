@@ -1,0 +1,33 @@
+version: "3.8"
+
+name: homelab-gateway
+
+networks:
+  gateway-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+          gateway: 172.30.0.1
+
+volumes:
+  portainer-data:
+  ntfy-data:
+  traefik-data:
+
+services:
+  # Portainer - Container management
+  portainer:
+    image: portainer/portainer-ce:2.21.0-alpine
+    container_name: portainer
+    restart: always
+    security_opt:
+      - label=disable
+    volumes:
+      - /run/podman/podman.sock:/run/podman/podman.sock
+      - portainer-data:/data
+    environment:
+      - TZ=${TZ}
+    ports:
+      - "9000:9000"
+      - "944

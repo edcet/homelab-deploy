@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-apiserver
+spec:
+  template:
+    spec:
+      tolerations: []
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-proxy
+spec:
+  template:
+    spec:
+      tolerations: []
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coredns
+spec:
+  template:
+    spec:
+      tolerations: []

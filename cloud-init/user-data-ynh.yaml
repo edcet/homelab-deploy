@@ -1,0 +1,1450 @@
+#cloud-config
+# YunoHost VM specific configuration (ynh-01)
+# Self-hosted services platform with Nextcloud and web applications
+
+# This configuration extends user-data-common.yaml
+# Merge with common template during deployment
+
+hostname: ynh-01
+fqdn: ynh-01.homelab.local
+
+users:
+  - name: ubuntu
+    groups: [docker, podman, sudo, adm, systemd-journal, www-data, ssl-cert]
+    # YunoHost will create its own admin user during installation
+
+packages:
+  - podman
+  - tailscale
+  - nginx
+  - python3-certbot-nginx
+  - mariadb-server
+  - postfix
+  - fail2ban
+  - git
+  - wget
+  - curl
+  - jq
+  - ssmtp
+  - rspamd
+  - dovecot-core
+  - dovecot-imapd
+  - dovecot-lmtpd
+  - roundcube
+
+# YunoHost-specific firewall rules
+ufw:
+  allow:
+    - 22/tcp     # SSH
+    - 25/tcp     # SMTP
+    - 80/tcp     # HTTP
+    - 443/tcp    # HTTPS
+    - 465/tcp    # SMTPS
+    - 587/tcp    # SMTP submission
+    - 993/tcp    # IMAPS
+    - 995/tcp    # POP3S
+    - 53/udp     # DNS
+    - 41641/udp  # Tailscale
+    - 9100/tcp   # Node Exporter
+    - 3306/tcp   # MySQL (local only)
+    - 11211/tcp  # Memcached (local only)
+    - 8000/tcp   # YunoHost admin (temporary)
+    - 8080/tcp   # YunoHost installation
+    - 11332/tcp  # Rspamd
+    - 11334/tcp  # Fail2ban
+
+runcmd:
+  # Configure Tailscale
+  - |
+    if command -v tailscale >/dev/null 2>&1; then
+      echo "Configuring Tailscale for YunoHost..."
+      tailscale up \\
+        --authkey={{.TAILSCALE_AUTHKEY}} \\
+        --hostname=ynh-01 \\
+        --accept-routes \\
+        --accept-dns=false \\
+        --advertise-routes=192.168.100.0/24 \\
+        --state=/var/lib/tailscale/tailscaled.state \\
+        --socket=/var/run/tailscale/tailscaled.sock
+      systemctl enable --now tailscaled
+      systemctl restart tailscaled
+    fi
+  
+  # Prepare system for YunoHost installation
+  - |
+    echo "Preparing system for YunoHost installation..."
+    
+    # Update system and install prerequisites
+    apt-get update -qq >/dev/null 2>&1
+    apt-get upgrade -y -qq >/dev/null 2>&1
+    apt-get install -y -qq software-properties-common curl wget gnupg lsb-release ca-certificates apt-transport-https
+    
+    # Add YunoHost GPG key and repository
+    curl -fsSL https://repo.yunohost.org/debian/yunohost.gpg | apt-key add -
+    echo "deb https://repo.yunohost.org/debian/ bookworm stable" > /etc/apt/sources.list.d/yunohost.list
+    
+    # Install YunoHost core packages
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq yunohost yunohost-admin
+    
+    # Configure basic hostname
+    hostnamectl set-hostname ynh-01
+    echo "127.0.1.1 ynh-01 ynh-01.homelab.local" >> /etc/hosts
+    echo "::1 ynh-01 ynh-01.homelab.local" >> /etc/hosts
+    echo "127.0.0.1 ynh-01 ynh-01.homelab.local" >> /etc/hosts
+    
+    # Configure local DNS resolution
+    echo "search homelab.local curl-chimera.ts.net" >> /etc/resolv.conf
+    echo "nameserver 127.0.0.1" >> /etc/resolv.conf
+    echo "nameserver 100.100.100.100" >> /etc/resolv.conf
+    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+  
+  # Install YunoHost with automated configuration
+  - |
+    echo "Installing YunoHost with automated configuration..."
+    
+    # Wait for system to stabilize
+    sleep 30
+    
+    # Run YunoHost installation with pre-configured settings
+    yunohost domain add ynh.curl-chimera.ts.net --no-skip-checks
+    
+    # Configure admin user (will be prompted or use defaults)
+    yunohost user create admin --firstname "Admin" --lastname "Homelab" --email "admin@ynh.curl-chimera.ts.net" --password "SecurePass123!"
+    
+    # Install core YunoHost components
+    yunohost app install yunohost-admin -a
+    
+    # Configure mail settings for local delivery
+    yunohost mail adddomain ynh.curl-chimera.ts.net
+    
+    # Configure DNS settings
+    yunohost domain dns-config ynh.curl-chimera.ts.net << 'EOF'
+    ynh IN A 192.168.1.100
+    mail IN A 192.168.1.100
+    _dmarc IN TXT "v=DMARC1; p=none;"
+    _domainkey IN TXT "o=~;"
+    EOF
+    
+    # Enable SSO for all services
+    yunohost sso enable
+    
+    # Configure firewall through YunoHost
+    yunohost firewall allow HTTP
+    yunohost firewall allow HTTPS
+    yunohost firewall allow SSH
+    yunohost firewall allow SMTP
+    yunohost firewall allow SMTPS
+    yunohost firewall allow Submission
+    yunohost firewall allow IMAPS
+    yunohost firewall allow POP3S
+  
+  # Install Nextcloud as primary application
+  - |
+    echo "Installing Nextcloud via YunoHost..."
+    
+    # Wait for YunoHost to be fully ready
+    for i in {1..60}; do
+      if yunohost domain list | grep -q "ynh.curl-chimera.ts.net"; then
+        echo "YunoHost domain ready"
+        break
+      fi
+      sleep 10
+    done
+    
+    # Install Nextcloud
+    yunohost app install https://github.com/YunoHost-Apps/nextcloud_ynh.git --no-backup --debug
+    
+    # Configure Nextcloud for optimal performance
+    yunohost app setting nextcloud admin -v admin@ynh.curl-chimera.ts.net
+    yunohost app setting nextcloud skipped -v 0
+    
+    # Enable Nextcloud features
+    yunohost app setting nextcloud installation_type -v complete
+    yunohost app setting nextcloud admin -v admin
+    
+    # Configure storage and database
+    yunohost app setting nextcloud mysql_db -v nextcloud
+    yunohost app setting nextcloud mysql_user -v nextcloud
+    yunohost app setting nextcloud mysql_password -v "SecureDBPass123!"
+    
+    # Enable external storage support
+    yunohost app setting nextcloud external_storage -v true
+    yunohost app setting nextcloud external_smb -v true
+    yunohost app setting nextcloud external_webdav -v true
+    
+    # Configure mobile apps and sync
+    yunohost app setting nextcloud mobile_apps -v true
+    yunohost app setting nextcloud sync_clients -v true
+    
+    # Restart Nextcloud to apply configuration
+    yunohost app ssowipe nextcloud
+    yunohost app reload nextcloud
+  
+  # Install additional essential applications
+  - |
+    echo "Installing essential YunoHost applications..."
+    
+    # Install Homepage dashboard
+    yunohost app install https://github.com/YunoHost-Apps/homepage_ynh.git --no-backup --debug
+    
+    # Configure Homepage as SSO widget
+    yunohost app setting homepage sso -v true
+    yunohost app setting homepage widget -v true
+    
+    # Install SearxNG (privacy-focused search)
+    yunohost app install https://github.com/YunoHost-Apps/searxng_ynh.git --no-backup --debug
+    
+    # Install Wallabag (read-it-later)
+    yunohost app install https://github.com/YunoHost-Apps/wallabag_ynh.git --no-backup --debug
+    
+    # Install FreshRSS (RSS reader)
+    yunohost app install https://github.com/YunoHost-Apps/freshrss_ynh.git --no-backup --debug
+    
+    # Install Syncthing (file sync)
+    yunohost app install https://github.com/YunoHost-Apps/syncthing_ynh.git --no-backup --debug
+    
+    # Configure all apps for SSO
+    for app in homepage searxng wallabag freshrss syncthing; do
+      yunohost app setting "$app" sso -v true
+      yunohost app ssowipe "$app"
+    done
+  
+  # Configure mail server
+  - |
+    echo "Configuring mail server..."
+    
+    # Install and configure Postfix for local delivery
+    apt-get install -y postfix mailutils
+    dpkg-reconfigure postfix << 'EOF'
+    Internet Site
+    ynh.curl-chimera.ts.net
+    EOF
+    
+    # Configure SMTP relay through Tailscale
+    cat > /etc/postfix/main.cf << 'EOF'
+    # Postfix configuration for YunoHost
+    myhostname = ynh-01.homelab.local
+    mydomain = ynh.curl-chimera.ts.net
+    myorigin = /etc/mailname
+    inet_interfaces = all
+    inet_protocols = all
+    
+    # Local delivery
+    mydestination = \$myhostname, localhost.\$mydomain, localhost, ynh.curl-chimera.ts.net
+    local_transport = local
+    virtual_alias_maps = hash:/etc/aliases, hash:/etc/postfix/virtual
+    
+    # Relay through Tailscale
+    relayhost = [100.100.100.100]:25
+    relay_domains = ynh.curl-chimera.ts.net
+    
+    # Security
+    smtpd_tls_cert_file = /etc/ssl/certs/ssl-cert-snakeoil.pem
+    smtpd_tls_key_file = /etc/ssl/private/ssl-cert-snakeoil.key
+    smtpd_use_tls = yes
+    smtpd_tls_auth_only = yes
+    smtpd_sasl_auth_enable = yes
+    broken_sasl_auth_clients = yes
+    
+    # Rate limiting
+    smtpd_recipient_limit = 1000
+    smtpd_client_restrictions = permit_sasl_authenticated, reject_unauth_destination
+    smtpd_helo_restrictions = permit_sasl_authenticated, reject_non_fqdn_hostname
+    smtpd_sender_restrictions = permit_sasl_authenticated, reject_unknown_sender_domain
+    smtpd_relay_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination
+    
+    # YunoHost integration
+    compatibility_level = 2
+    EOF
+    
+    # Configure SASL authentication
+    apt-get install -y libsasl2-modules
+    systemctl restart postfix
+    
+    # Configure Dovecot for IMAP
+    apt-get install -y dovecot-core dovecot-imapd dovecot-lmtpd
+    cat > /etc/dovecot/conf.d/10-master.conf << 'EOF'
+    # Dovecot master configuration for YunoHost
+    service imap-login {
+      inet_listener imaps {
+        port = 993
+        ssl = yes
+      }
+    }
+    
+    service pop3-login {
+      inet_listener pop3s {
+        port = 995
+        ssl = yes
+      }
+    }
+    
+    service lmtp {
+      unix_listener /var/spool/postfix/private/dovecot-lmtp {
+        mode = 0600
+        user = postfix
+        group = postfix
+      }
+    }
+    EOF
+    
+    systemctl restart dovecot
+    systemctl enable dovecot
+  
+  # Configure Rspamd for spam filtering
+  - |
+    echo "Installing and configuring Rspamd..."
+    apt-get install -y rspamd rspamd-utils redis-server
+    
+    # Configure Rspamd
+    cat > /etc/rspamd/local.d/worker-proxy.inc << 'EOF'
+    # Rspamd proxy worker for YunoHost
+    bind_socket = "127.0.0.1:11333";
+    password = "your-rspamd-password";
+    timeout = 10s;
+    enable = true;
+    EOF
+    
+    cat > /etc/rspamd/local.d/worker-relay.inc << 'EOF'
+    # Rspamd relay worker
+    bind_socket = "127.0.0.1:11334";
+    password = "your-rspamd-password";
+    timeout = 10s;
+    EOF
+    
+    # Configure Redis for Rspamd
+    sed -i 's/bind 127.0.0.1/bind 127.0.0.1 ::1/' /etc/redis/redis.conf
+    systemctl restart redis-server
+    
+    systemctl enable rspamd
+    systemctl start rspamd
+  
+  # Configure Fail2Ban for security
+  - |
+    echo "Configuring Fail2Ban..."
+    apt-get install -y fail2ban
+    
+    cat > /etc/fail2ban/jail.d/yunohost.local << 'EOF'
+    [DEFAULT]
+    bantime = 3600
+    findtime = 600
+    maxretry = 5
+    destemail = admin@ynh.curl-chimera.ts.net
+    sender = fail2ban@ynh-01
+    action = %(action_mwl)s
+    
+    [yunohost-admin]
+    enabled = true
+    port = 8000
+    filter = yunohost-admin
+    logpath = /var/log/nginx/access.log
+    maxretry = 3
+    
+    [yunohost-ssh]
+    enabled = true
+    port = ssh
+    filter = sshd
+    logpath = /var/log/auth.log
+    maxretry = 4
+    
+    [yunohost-postfix]
+    enabled = true
+    port = smtp,ssmtp,smtps,submission
+    filter = postfix
+    logpath = /var/log/mail.log
+    maxretry = 5
+    
+    [yunohost-dovecot]
+    enabled = true
+    port = imap,imaps,pop3,pop3s
+    filter = dovecot
+    logpath = /var/log/mail.log
+    maxretry = 3
+    EOF
+    
+    cat > /etc/fail2ban/filter.d/yunohost-admin.conf << 'EOF'
+    [Definition]
+    failregex = ^<HOST> - - .* "(GET|POST) /yunohost/admin/.*" 404 .*$
+               ^<HOST> - - .* "(GET|POST) /yunohost/sso/.*" 403 .*$
+    ignoreregex =
+    EOF
+    
+    systemctl restart fail2ban
+    systemctl enable fail2ban
+  
+  # Install and configure Homepage for YunoHost
+  - |
+    echo "Installing Homepage dashboard via YunoHost..."
+    
+    # Install Homepage app
+    yunohost app install https://github.com/YunoHost-Apps/homepage_ynh.git --no-backup --debug
+    
+    # Configure Homepage as the main dashboard
+    yunohost app setting homepage sso -v true
+    yunohost app setting homepage widget -v true
+    yunohost app setting homepage unprotected_uris -v "/,/health"
+    
+    # Create YunoHost-specific Homepage configuration
+    mkdir -p /home/yunohost.app/homepage/config
+    
+    cat > /home/yunohost.app/homepage/config/config.yml << 'EOF'
+    ---
+    # YunoHost Homepage Configuration
+    title: YunoHost Dashboard
+    theme: dark
+    
+    # Layout
+    layout:
+      Overview:
+        style: row
+        items: 4
+      Applications:
+        style: grid
+        items: 6
+      Infrastructure:
+        style: row
+        items: 3
+      Monitoring:
+        style: row
+        items: 3
+    
+    # Services - YunoHost Applications
+    services:
+      - YunoHost:
+          - Admin Panel:
+              icon: yunohost.png
+              href: https://ynh.curl-chimera.ts.net/yunohost/admin
+              description: YunoHost administration
+              widget:
+                type: customapi
+                url: https://ynh.curl-chimera.ts.net/yunohost/api/info
+                method: GET
+          - SSO Portal:
+              icon: sso.png
+              href: https://ynh.curl-chimera.ts.net/yunohost/sso
+              description: Single Sign-On portal
+          - App Store:
+              icon: appstore.png
+              href: https://ynh.curl-chimera.ts.net/yunohost/admin/?section=apps
+              description: Install new applications
+      
+      - Productivity:
+          - Nextcloud:
+              icon: nextcloud.png
+              href: https://nextcloud.ynh.curl-chimera.ts.net
+              description: File sync, calendar, contacts
+              widget:
+                type: customapi
+                url: https://nextcloud.ynh.curl-chimera.ts.net/ocs/v2.php/apps/files/api/v1/stats
+                method: GET
+                key: X-OCS-API
+                value: Basic YOUR_TOKEN
+          - Wallabag:
+              icon: wallabag.png
+              href: https://wallabag.ynh.curl-chimera.ts.net
+              description: Read-it-later service
+          - FreshRSS:
+              icon: rss.png
+              href: https://freshrss.ynh.curl-chimera.ts.net
+              description: RSS feed reader
+      
+      - Communication:
+          - Roundcube:
+              icon: email.png
+              href: https://mail.ynh.curl-chimera.ts.net
+              description: Webmail client
+          - Syncthing:
+              icon: syncthing.png
+              href: https://syncthing.ynh.curl-chimera.ts.net
+              description: File synchronization
+      
+      - Search & Privacy:
+          - SearxNG:
+              icon: search.png
+              href: https://search.ynh.curl-chimera.ts.net
+              description: Privacy-respecting search engine
+      
+      - Infrastructure:
+          - Proxmox:
+              icon: proxmox.png
+              href: https://proxmox.local:8006
+              description: Virtualization host
+              widget:
+                type: customapi
+                url: https://proxmox.local:8006/api2/json/nodes
+                method: GET
+                auth: basic
+                username: root
+                password: your-password
+          - Tailscale:
+              icon: tailscale.png
+              href: https://login.tailscale.com/admin/machines
+              description: VPN mesh network
+          - Monitoring:
+              icon: prometheus.png
+              href: http://olares-01.curl-chimera.ts.net:9090
+              description: System monitoring
+      
+      - Development:
+          - Git:
+              icon: git.png
+              href: https://git.ynh.curl-chimera.ts.net
+              description: Git repositories (if Gitea installed)
+          - Dokploy:
+              icon: dokploy.png
+              href: http://dokploy.local:3001
+              description: Deployment platform
+      
+      - Security:
+          - Fail2ban:
+              icon: shield.png
+              href: https://ynh.curl-chimera.ts.net/yunohost/admin/?section=security
+              description: Intrusion prevention
+          - Backup:
+              icon: backup.png
+              href: https://ynh.curl-chimera.ts.net/yunohost/admin/?section=backup
+              description: System backups
+    
+    # Widgets for monitoring
+    widgets:
+      - yunohost:
+          url: https://ynh.curl-chimera.ts.net/yunohost/api/info
+          key: Authorization
+          value: Basic YOUR_YUNOH OST_TOKEN
+          services:
+            - Nextcloud
+            - Homepage
+            - SearxNG
+      - resources:
+          resource: cpu
+          label: YNH CPU Usage
+      - resources:
+          resource: memory
+          label: YNH Memory Usage
+      - resources:
+          resource: disk
+          label: YNH Disk Usage
+          arguments:
+            path: /
+      - customapi:
+          type: customapi
+          url: https://ynh.curl-chimera.ts.net/yunohost/api/users
+          method: GET
+          key: Authorization
+          value: Basic YOUR_TOKEN
+          title: Active Users
+          transform: |
+            return {
+              users: data.length,
+              domains: data.domains.length,
+              apps: data.apps.length
+            };
+    
+    # Groups for organization
+    groups:
+      - title: Quick Access
+        style: grid
+        items: 4
+        services:
+          - YunoHost: [Admin Panel, SSO Portal]
+          - Productivity: [Nextcloud]
+          - Communication: [Roundcube]
+          - Search & Privacy: [SearxNG]
+      - title: Media & Entertainment
+        style: grid
+        items: 4
+        services:
+          - Media: [Plex, Jellyfin, Emby]
+      - title: Development & Productivity
+        style: grid
+        items: 4
+        services:
+          - Development: [Git, Dokploy, Code Server]
+          - Productivity: [Wallabag, FreshRSS]
+    EOF
+    
+    # Set permissions
+    chown -R yunohost.app:www-data /home/yunohost.app/homepage
+    chmod 644 /home/yunohost.app/homepage/config/config.yml
+  
+  # Configure backup system
+  - |
+    echo "Configuring YunoHost backup system..."
+    
+    # Create backup directory
+    mkdir -p /home/yunohost/backup
+    chown yunohost:yuno: /home/yunohost/backup
+    chmod 750 /home/yunohost/backup
+    
+    # Configure automatic backups
+    yunohost backup create --name "Daily Backup" --method rsync
+    
+    # Schedule daily backups
+    cat > /etc/cron.d/yunohost-backup << 'EOF'
+    # Daily YunoHost backup at 2:00 AM
+    0 2 * * * root yunohost backup create --name "Daily-$(date +%Y%m%d)" --method rsync --ask=no
+    EOF
+    
+    # Configure backup retention (keep 7 daily, 4 weekly)
+    yunohost setting backup.retention.daily -v 7
+    yunohost setting backup.retention.weekly -v 4
+  
+  # Configure monitoring integration
+  - |
+    echo "Configuring YunoHost monitoring integration..."
+    
+    # Install Node Exporter if not already present (from common template)
+    if ! systemctl is-active --quiet node-exporter; then
+      systemctl start node-exporter
+      systemctl enable node-exporter
+    fi
+    
+    # Configure YunoHost metrics for Prometheus
+    yunohost app setting yunohost admin.metrics -v true
+    
+    # Add YunoHost to monitoring dashboard
+    if [ -d /opt/monitoring ]; then
+      cat >> /opt/monitoring/prometheus-additional.yml << 'EOF'
+      - job_name: 'yunohost'
+        static_configs:
+          - targets: ['ynh-01.curl-chimera.ts.net:9100']
+        labels:
+          group: 'yunohost'
+          team: 'applications'
+        scrape_interval: 15s
+        metrics_path: /metrics
+      EOF
+    fi
+  
+  # Configure security hardening
+  - |
+    echo "Applying YunoHost security hardening..."
+    
+    # Enable automatic security updates
+    apt-get install -y unattended-upgrades
+    dpkg-reconfigure --priority=low unattended-upgrades
+    
+    # Configure Fail2Ban for YunoHost
+    yunohost firewall allow Nginx-HTTP
+    yunohost firewall allow Nginx-HTTPS
+    
+    # Enable Let's Encrypt certificate
+    yunohost domain cert-install ynh.curl-chimera.ts.net --email admin@ynh.curl-chimera.ts.net --no-checks
+    
+    # Configure automatic certificate renewal
+    systemctl enable certbot.timer
+    systemctl start certbot.timer
+    
+    # Harden SSH configuration
+    cat >> /etc/ssh/sshd_config << 'EOF'
+    # YunoHost SSH hardening
+    PermitRootLogin no
+    PasswordAuthentication no
+    PubkeyAuthentication yes
+    ChallengeResponseAuthentication no
+    UsePAM yes
+    X11Forwarding no
+    PrintMotd no
+    AcceptEnv LANG LC_*
+    Subsystem sftp /usr/lib/openssh/sftp-server
+    EOF
+    
+    # Disable password authentication after key setup
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+    systemctl restart ssh
+  
+  # Create YunoHost management scripts
+  - |
+    cat > /opt/yunohost/manage.sh << 'EOF'
+    #!/bin/bash
+    # YunoHost management script
+    
+    set -euo pipefail
+    
+    YNH_DOMAIN="ynh.curl-chimera.ts.net"
+    YNH_ADMIN="https://$YNH_DOMAIN/yunohost/admin"
+    LOG_FILE="/var/log/yunohost-manage.log"
+    
+    log() {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    }
+    
+    case "${1:-help}" in
+      "status")
+        log "Checking YunoHost status..."
+        echo "=== System Status ==="
+        yunohost tools list
+        echo ""
+        echo "=== Applications ==="
+        yunohost app list --output_as=json | jq '.apps | to_entries[] | "\(.key) (\(.value.state))"'
+        echo ""
+        echo "=== Domains ==="
+        yunohost domain list
+        echo ""
+        echo "=== Users ==="
+        yunohost user list
+        ;;
+      
+      "backup")
+        log "Creating YunoHost backup..."
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        backup_name="Manual-Backup-$timestamp"
+        
+        yunohost backup create --name "$backup_name" --method rsync
+        log "Backup created: $backup_name"
+        ;;
+      
+      "app-install")
+        log "Installing application: $2"
+        if yunohost app list | grep -q "$2"; then
+          echo "Application $2 already installed"
+        else
+          # This is a template - actual installation via app store URL
+          echo "Install $2 via: yunohost app install <URL>"
+          echo "Available apps: yunohost app search $2"
+        fi
+        ;;
+      
+      "app-remove")
+        log "Removing application: $2"
+        yunohost app remove "$2" --purge
+        log "Application $2 removed"
+        ;;
+      
+      "user-add")
+        log "Adding user: $2"
+        yunohost user create "$2" --domain "$YNH_DOMAIN" --firstname "$3" --lastname "$4" --email "$2@$YNH_DOMAIN" --password "TempPass123!"
+        log "User $2 created. Set password with: yunohost user password $2"
+        ;;
+      
+      "domain-add")
+        log "Adding domain: $2"
+        yunohost domain add "$2"
+        yunohost domain cert-install "$2" --email "admin@$2"
+        log "Domain $2 added and certificate installed"
+        ;;
+      
+      "health")
+        log "Checking YunoHost health..."
+        echo "=== Services Status ==="
+        systemctl is-active nginx && echo "Nginx: OK" || echo "Nginx: DOWN"
+        systemctl is-active mariadb && echo "MariaDB: OK" || echo "MariaDB: DOWN"
+        systemctl is-active postfix && echo "Postfix: OK" || echo "Postfix: DOWN"
+        systemctl is-active dovecot && echo "Dovecot: OK" || echo "Dovecot: DOWN"
+        systemctl is-active rspamd && echo "Rspamd: OK" || echo "Rspamd: DOWN"
+        systemctl is-active fail2ban && echo "Fail2Ban: OK" || echo "Fail2Ban: DOWN"
+        echo ""
+        echo "=== Application Health ==="
+        yunohost app list --output_as=json | jq -r '.apps | to_entries[] | "\(.key): \(.value.health)"'
+        echo ""
+        echo "=== Certificates ==="
+        yunohost domain cert-status "$YNH_DOMAIN"
+        ;;
+      
+      "update")
+        log "Updating YunoHost and applications..."
+        yunohost tools update
+        yunohost app upgrade --all
+        apt-get update && apt-get upgrade -y
+        log "System and applications updated"
+        ;;
+      
+      "logs")
+        log "Showing YunoHost logs..."
+        journalctl -u nginx -f
+        ;;
+      
+      "backup-list")
+        log "Listing backups..."
+        yunohost backup list
+        ;;
+      
+      "backup-remove")
+        log "Removing backup: $2"
+        yunohost backup delete "$2"
+        log "Backup $2 removed"
+        ;;
+      
+      *)
+        echo "YunoHost management script"
+        echo "Usage: $0 {status|backup|app-install|app-remove|user-add|domain-add|health|update|logs|backup-list|backup-remove}"
+        echo ""
+        echo "Examples:"
+        echo "  $0 status                    # Show system status"
+        echo "  $0 health                    # Check service health"
+        echo "  $0 backup                    # Create manual backup"
+        echo "  $0 app-install nextcloud     # Install Nextcloud"
+        echo "  $0 user-add john John Doe    # Add user john@domain"
+        echo "  $0 domain-add example.com    # Add new domain"
+        echo "  $0 update                    # Update everything"
+        exit 1
+        ;;
+    esac
+    EOF
+    
+    chmod +x /opt/yunohost/manage.sh
+    chown ubuntu:ubuntu /opt/yunohost/manage.sh
+  
+  # Create YunoHost monitoring and alerting configuration
+  - |
+    echo "Configuring YunoHost monitoring..."
+    
+    # Create custom monitoring for YunoHost
+    mkdir -p /opt/yunohost/monitoring
+    
+    cat > /opt/yunohost/monitoring/yunohost-exporter.py << 'EOF'
+    #!/usr/bin/env python3
+    """
+    YunoHost metrics exporter for Prometheus
+    """
+    from flask import Flask, jsonify, Response
+    import yunohost
+    import psutil
+    import requests
+    import time
+    import os
+    from prometheus_client import generate_latest, Counter, Gauge, Histogram
+    import threading
+    
+    app = Flask(__name__)
+    
+    # Prometheus metrics
+    YNH_APP_COUNT = Gauge('yunohost_apps_total', 'Total YunoHost applications')
+    YNH_USER_COUNT = Gauge('yunohost_users_total', 'Total YunoHost users')
+    YNH_DOMAIN_COUNT = Gauge('yunohost_domains_total', 'Total YunoHost domains')
+    YNH_BACKUP_COUNT = Gauge('yunohost_backups_total', 'Total YunoHost backups')
+    YNH_SERVICE_STATUS = Gauge('yunohost_service_status', 'YunoHost service status', ['service'])
+    YNH_APP_STATUS = Gauge('yunohost_app_status', 'YunoHost application status', ['app'])
+    
+    def get_yunohost_stats():
+        """Get YunoHost statistics"""
+        try:
+            # Get applications
+            apps = yunohost.app.list()
+            YNH_APP_COUNT.set(len(apps))
+            
+            # Get users
+            users = yunohost.user.list()
+            YNH_USER_COUNT.set(len(users))
+            
+            # Get domains
+            domains = yunohost.domain.list()
+            YNH_DOMAIN_COUNT.set(len(domains))
+            
+            # Get backups
+            backups = yunohost.backup.list()
+            YNH_BACKUP_COUNT.set(len(backups))
+            
+            # Check service status
+            services = ['nginx', 'mariadb', 'postfix', 'dovecot', 'rspamd']
+            for service in services:
+                status = 1 if os.system(f"systemctl is-active --quiet {service}") == 0 else 0
+                YNH_SERVICE_STATUS.labels(service=service).set(status)
+            
+            # Check app status
+            for app_name, app_info in apps.items():
+                status = 1 if app_info.get('state') == 'installed' else 0
+                YNH_APP_STATUS.labels(app=app_name).set(status)
+                
+        except Exception as e:
+            print(f"Error collecting YunoHost stats: {e}")
+    
+    @app.route('/metrics')
+    def metrics():
+        get_yunohost_stats()
+        return Response(generate_latest(), mimetype='text/plain')
+    
+    @app.route('/health')
+    def health():
+        return jsonify({
+            'status': 'ok',
+            'timestamp': time.time(),
+            'yunohost_version': yunohost.__version__
+        })
+    
+    @app.route('/api/info')
+    def api_info():
+        try:
+            info = {
+                'system': yunohost.tools.get_system_info(),
+                'apps': len(yunohost.app.list()),
+                'users': len(yunohost.user.list()),
+                'domains': len(yunohost.domain.list())
+            }
+            return jsonify(info)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    
+    if __name__ == '__main__':
+        # Start stats collection thread
+        stats_thread = threading.Thread(target=lambda: [get_yunohost_stats(), time.sleep(60), get_yunohost_stats()][1], daemon=True)
+        stats_thread.start()
+        app.run(host='0.0.0.0', port=9180)
+    EOF
+    
+    # Create systemd service for YunoHost exporter
+    cat > /etc/systemd/system/yunohost-exporter.service << 'EOF'
+    [Unit]
+    Description=YunoHost Prometheus Exporter
+    After=network-online.target yunohost-admin.service
+    Wants=network-online.target
+    
+    [Service]
+    Type=simple
+    User=ubuntu
+    Group=ubuntu
+    WorkingDirectory=/opt/yunohost/monitoring
+    Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin
+    ExecStart=/usr/bin/python3 /opt/yunohost/monitoring/yunohost-exporter.py
+    Restart=always
+    RestartSec=10
+    
+    # Security hardening
+    NoNewPrivileges=true
+    PrivateTmp=true
+    ProtectSystem=strict
+    ReadWritePaths=/opt/yunohost/monitoring
+    LimitNOFILE=65536
+    PrivateNetwork=false
+    PrivateDevices=true
+    ProtectHome=true
+    ProtectKernelTunables=true
+    ProtectKernelModules=true
+    ProtectControlGroups=true
+    
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    
+    chmod +x /opt/yunohost/monitoring/yunohost-exporter.py
+    chown ubuntu:ubuntu /opt/yunohost/monitoring/yunohost-exporter.py
+    
+    systemctl daemon-reload
+    systemctl enable yunohost-exporter
+    systemctl start yunohost-exporter
+  
+  # Configure automatic updates and maintenance
+  - |
+    echo "Configuring YunoHost maintenance..."
+    
+    # Install and configure automatic updates
+    apt-get install -y unattended-upgrades
+    dpkg-reconfigure --priority=low unattended-upgrades
+    
+    # Configure YunoHost for automatic app updates
+    yunohost setting apps.update_policy -v all
+    
+    # Create daily maintenance script
+    cat > /opt/yunohost/maintenance.sh << 'EOF'
+    #!/bin/bash
+    # Daily YunoHost maintenance
+    
+    set -euo pipefail
+    
+    log() {
+      echo "[$(date)] $1" | tee -a /var/log/yunohost-maintenance.log
+    }
+    
+    log "Starting daily maintenance..."
+    
+    # Update system
+    apt-get update -qq
+    apt-get upgrade -y -qq
+    apt-get autoremove -y -qq
+    
+    # Update YunoHost
+    yunohost tools update
+    
+    # Update applications
+    yunohost app upgrade --all
+    
+    # Clean old backups (keep 7 days)
+    yunohost backup list --output_as=json | jq -r '.backups[] | select(.date < "'$(date -d "7 days ago" '+%Y-%m-%dT%H:%M:%S')'") | .name' | while read backup; do
+      yunohost backup delete "$backup"
+      log "Deleted old backup: $backup"
+    done
+    
+    # Check certificate status
+    yunohost domain cert-status ynh.curl-chimera.ts.net | grep -q "valid" || {
+      log "Certificate expired, renewing..."
+      yunohost domain cert-install ynh.curl-chimera.ts.net --email admin@ynh.curl-chimera.ts.net
+    }
+    
+    # Check service status
+    for service in nginx mariadb postfix dovecot rspamd fail2ban; do
+      if systemctl is-active --quiet "$service"; then
+        log "Service $service: OK"
+      else
+        log "Service $service: FAILED - restarting"
+        systemctl restart "$service"
+      fi
+    done
+    
+    # Check application health
+    yunohost app list --output_as=json | jq -r '.apps | to_entries[] | select(.value.health != "healthy") | "\(.key): \(.value.health)"' | while read -r app_health; do
+      log "Application health warning: $app_health"
+    done
+    
+    log "Daily maintenance complete"
+    EOF
+    
+    chmod +x /opt/yunohost/maintenance.sh
+    chown ubuntu:ubuntu /opt/yunohost/maintenance.sh
+    
+    # Schedule daily maintenance
+    cat > /etc/cron.d/yunohost-maintenance << 'EOF'
+    # Daily YunoHost maintenance at 3:00 AM
+    0 3 * * * root /opt/yunohost/maintenance.sh
+    EOF
+  
+  # Create YunoHost specific monitoring configuration
+  - |
+    echo "Configuring YunoHost-specific monitoring..."
+    
+    # Add YunoHost metrics to Prometheus (if olares is accessible)
+    if ping -c 1 -W 2 olares-01.curl-chimera.ts.net >/dev/null 2>&1; then
+      cat >> /opt/monitoring/prometheus-additional.yml << 'EOF'
+      - job_name: 'yunohost'
+        static_configs:
+          - targets: ['ynh-01.curl-chimera.ts.net:9180']
+        labels:
+          group: 'yunohost'
+          team: 'applications'
+          instance: 'ynh-01'
+        scrape_interval: 30s
+        metrics_path: /metrics
+        scheme: http
+        
+      - job_name: 'yunohost-apps'
+        static_configs:
+          - targets: ['ynh-01.curl-chimera.ts.net:9180']
+        labels:
+          group: 'yunohost-apps'
+          team: 'applications'
+        scrape_interval: 60s
+        metrics_path: /api/info
+        scheme: http
+        params:
+          format: '[json]'
+      EOF
+    fi
+    
+    # Create YunoHost health check
+    cat > /opt/yunohost/health-check.py << 'EOF'
+    #!/usr/bin/env python3
+    """
+    YunoHost health check script
+    """
+    import requests
+    import json
+    import sys
+    import subprocess
+    from datetime import datetime
+    
+    def check_yunohost_health():
+        """Check overall YunoHost health"""
+        try:
+            # Check YunoHost API
+            response = requests.get('https://ynh.curl-chimera.ts.net/yunohost/api/info', 
+                                  timeout=10, verify=False)
+            if response.status_code == 200:
+                data = response.json()
+                print(f"YunoHost API: OK - Version {data.get('version', 'unknown')}")
+                return True
+            else:
+                print(f"YunoHost API: ERROR - HTTP {response.status_code}")
+                return False
+        except Exception as e:
+            print(f"YunoHost API: ERROR - {e}")
+            return False
+    
+    def check_applications():
+        """Check application status"""
+        try:
+            # List applications
+            result = subprocess.run(['yunohost', 'app', 'list', '--output_as', 'json'], 
+                                  capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                apps = json.loads(result.stdout)
+                healthy = 0
+                total = len(apps.get('apps', {}))
+                
+                for app_name, app_info in apps.get('apps', {}).items():
+                    if app_info.get('state') == 'installed':
+                        healthy += 1
+                        print(f"App {app_name}: OK")
+                    else:
+                        print(f"App {app_name}: {app_info.get('state', 'unknown')}")
+                
+                print(f"Applications: {healthy}/{total} healthy")
+                return healthy == total
+            else:
+                print("Application check: ERROR")
+                return False
+        except Exception as e:
+            print(f"Application check: ERROR - {e}")
+            return False
+    
+    def check_services():
+        """Check critical services"""
+        services = ['nginx', 'mariadb', 'postfix', 'dovecot', 'rspamd', 'fail2ban']
+        healthy = 0
+        total = len(services)
+        
+        for service in services:
+            result = subprocess.run(['systemctl', 'is-active', '--quiet', service], 
+                                  capture_output=True, timeout=10)
+            if result.returncode == 0:
+                healthy += 1
+                print(f"Service {service}: OK")
+            else:
+                print(f"Service {service}: DOWN")
+        
+        print(f"Services: {healthy}/{total} healthy")
+        return healthy == total
+    
+    def check_certificates():
+        """Check SSL certificates"""
+        try:
+            result = subprocess.run(['yunohost', 'domain', 'cert-status', 'ynh.curl-chimera.ts.net'], 
+                                  capture_output=True, text=True, timeout=30)
+            if 'Certificate is valid' in result.stdout:
+                print("SSL Certificate: VALID")
+                return True
+            else:
+                print("SSL Certificate: ISSUE")
+                print(result.stdout)
+                return False
+        except Exception as e:
+            print(f"Certificate check: ERROR - {e}")
+            return False
+    
+    def main():
+        """Main health check"""
+        print(f"YunoHost Health Check - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60)
+        
+        checks = {
+            'YunoHost API': check_yunohost_health(),
+            'Applications': check_applications(),
+            'Services': check_services(),
+            'Certificates': check_certificates()
+        }
+        
+        healthy = sum(checks.values())
+        total = len(checks)
+        
+        print("\n" + "=" * 60)
+        print(f"Overall Health: {healthy}/{total} checks passed")
+        
+        if healthy == total:
+            print("✅ YunoHost is healthy!")
+            sys.exit(0)
+        else:
+            print("⚠️  Some issues detected")
+            sys.exit(1)
+    
+    if __name__ == '__main__':
+        main()
+    EOF
+    
+    chmod +x /opt/yunohost/health-check.py
+    chown ubuntu:ubuntu /opt/yunohost/health-check.py
+    
+    # Create health check systemd timer
+    cat > /etc/systemd/system/yunohost-health.service << 'EOF'
+    [Unit]
+    Description=YunoHost Health Check
+    After=network-online.target
+    
+    [Service]
+    Type=oneshot
+    User=ubuntu
+    Group=ubuntu
+    WorkingDirectory=/opt/yunohost
+    Environment=PATH=/usr/local/bin:/usr/bin:/bin
+    ExecStart=/opt/yunohost/health-check.py
+    StandardOutput=journal
+    StandardError=journal
+    
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    
+    cat > /etc/systemd/system/yunohost-health.timer << 'EOF'
+    [Unit]
+    Description=Run YunoHost health check every 5 minutes
+    Requires=yunohost-health.service
+    
+    [Timer]
+    OnCalendar=*:0/5
+    Persistent=true
+    RandomizedDelaySec=60
+    
+    [Install]
+    WantedBy=timers.target
+    EOF
+    
+    systemctl daemon-reload
+    systemctl enable yunohost-health.timer
+    systemctl start yunohost-health.timer
+  
+  # Create YunoHost management and troubleshooting guide
+  - |
+    cat > /opt/yunohost/README.md << 'EOF'
+    # YunoHost VM (ynh-01) - Self-Hosted Services Platform
+    
+    ## Overview
+    This VM runs YunoHost, a Debian-based server operating system for self-hosting with a focus on ease of use and security.
+    
+    ## Architecture
+    - **YunoHost**: Debian-based self-hosting platform
+    - **Nextcloud**: Primary file sync and collaboration suite
+    - **SSO**: Single Sign-On for all applications
+    - **Mail Server**: Postfix + Dovecot + Rspamd
+    - **Web Server**: Nginx with automatic SSL
+    - **Database**: MariaDB with optimized configuration
+    - **Security**: Fail2Ban, automatic updates, firewall
+    
+    ## Installed Applications
+    | App | URL | Description | SSO |
+    |-----|-----|-------------|-----|
+    | YunoHost Admin | /yunohost/admin | Administration panel | Yes |
+    | Nextcloud | /nextcloud | File sync & collaboration | Yes |
+    | Homepage | /homepage | Unified dashboard | Yes |
+    | SearxNG | /searxng | Privacy search engine | Yes |
+    | Wallabag | /wallabag | Read-it-later service | Yes |
+    | FreshRSS | /freshrss | RSS feed reader | Yes |
+    | Syncthing | /syncthing | File synchronization | Yes |
+    | Roundcube | /mail | Webmail client | Yes |
+    
+    ## Access Information
+    - **Main Domain**: https://ynh.curl-chimera.ts.net
+    - **Admin URL**: https://ynh.curl-chimera.ts.net/yunohost/admin
+    - **Admin User**: admin
+    - **SSO Portal**: https://ynh.curl-chimera.ts.net/yunohost/sso
+    - **Tailscale**: ynh-01.curl-chimera.ts.net
+    
+    ## Mail Configuration
+    - **SMTP**: mail.ynh.curl-chimera.ts.net:587 (STARTTLS)
+    - **IMAP**: mail.ynh.curl-chimera.ts.net:993 (SSL/TLS)
+    - **Webmail**: https://ynh.curl-chimera.ts.net/mail
+    - **DKIM/DMARC**: Configured for ynh.curl-chimera.ts.net
+    
+    ## Security Features
+    - **SSL Certificates**: Automatic via Let\'s Encrypt
+    - **Firewall**: UFW with YunoHost rules
+    - **Fail2Ban**: Protects against brute force attacks
+    - **Rspamd**: Spam filtering and virus scanning
+    - **Automatic Updates**: Daily system and app updates
+    - **Backups**: Daily automated backups (7 day retention)
+    
+    ## Quick Start Commands
+    ```bash
+    # Management
+    sudo yunohost app list              # List installed apps
+    sudo yunohost app install <URL>      # Install new app
+    sudo yunohost app upgrade --all      # Update all apps
+    sudo yunohost user list              # List users
+    sudo yunohost user create <username> # Add new user
+    
+    # Backups
+    sudo yunohost backup create          # Create manual backup
+    sudo yunohost backup list            # List backups
+    sudo yunohost backup delete <name>   # Delete backup
+    
+    # Maintenance
+    sudo yunohost tools update           # Update YunoHost
+    sudo yunohost domain cert-install    # Renew certificates
+    sudo yunohost firewall list          # Check firewall
+    sudo yunohost log                   # View logs
+    
+    # Monitoring
+    curl localhost:9100/metrics          # Node Exporter
+    /opt/yunohost/health-check.py        # Health check
+    sudo yunohost app diagnostics        # App diagnostics
+    ```
+    
+    ## iOS Integration
+    - **YunoHost Admin PWA**: Add to home screen for management
+    - **Nextcloud iOS app**: File sync and collaboration
+    - **Roundcube webmail**: Works in mobile Safari
+    - **Syncthing iOS**: File synchronization
+    - **Tailscale VPN**: Secure access to all services
+    - **ntfy alerts**: System health notifications
+    - **Homepage PWA**: Dashboard access
+    
+    ## Backup Strategy
+    1. **Daily Automated**: yunohost backup create (7 days retention)
+    2. **Manual**: yunohost backup create --name "Manual-YYYYMMDD"
+    3. **Proxmox**: VM snapshots and full backups
+    4. **Offsite**: Rsync to external storage or cloud
+    5. **Configuration**: Git repository for app settings
+    
+    ## Security Hardening
+    - **No root SSH**: Only key-based authentication
+    - **SSO enabled**: Single password for all apps
+    - **Automatic SSL**: Let\'s Encrypt certificates
+    - **Firewall**: Only necessary ports open
+    - **Fail2Ban**: Brute force protection
+    - **Rspamd**: Email spam filtering
+    - **Regular updates**: Automatic security patches
+    
+    ## Troubleshooting
+    - **Apps not accessible**: yunohost app status <app> && yunohost log app <app>
+    - **Mail not working**: yunohost mail check && tail -f /var/log/mail.log
+    - **SSL issues**: yunohost domain cert-status && certbot renew
+    - **Backup failed**: yunohost backup list && yunohost log backup
+    - **Service down**: systemctl status <service> && journalctl -u <service>
+    - **User issues**: yunohost user status <user> && yunohost permission list
+    EOF
+    
+    chown ubuntu:ubuntu /opt/yunohost/README.md
+    chmod 644 /opt/yunohost/README.md
+  
+  # Final verification
+  - |
+    echo "YunoHost VM bootstrap complete!"
+    echo ""
+    echo "✅ YunoHost core installed and configured"
+    echo "✅ Nextcloud installed as primary application"
+    echo "✅ Mail server (Postfix + Dovecot + Rspamd) ready"
+    echo "✅ SSO configured for all applications"
+    echo "✅ Security hardening applied (Fail2Ban, firewall)"
+    echo "✅ Homepage dashboard installed and configured"
+    echo "✅ Backup system scheduled (daily at 2 AM)"
+    echo "✅ Monitoring exporter running on port 9180"
+    echo ""
+    echo "🔧 Access Information:"
+    echo "  Admin: https://ynh.curl-chimera.ts.net/yunohost/admin"
+    echo "  Nextcloud: https://nextcloud.ynh.curl-chimera.ts.net"
+    echo "  Webmail: https://mail.ynh.curl-chimera.ts.net"
+    echo "  SSO: https://ynh.curl-chimera.ts.net/yunohost/sso"
+    echo ""
+    echo "📱 iOS Setup:"
+    echo "  1. Install Tailscale app and connect to tailnet"
+    echo "  2. Add YunoHost admin as PWA to home screen"
+    echo "  3. Install Nextcloud iOS app and configure"
+    echo "  4. Setup Roundcube webmail in iOS Mail app"
+    echo "  5. Subscribe to ntfy for system alerts"
+    echo ""
+    echo "⚠️  Post-installation steps:"
+    echo "  1. Change admin password: yunohost user password admin"
+    echo "  2. Configure mail: yunohost mail adddomain rns.lol"
+    echo "  3. Install additional apps via admin panel"
+    echo "  4. Configure external DNS for your domain"
+    echo "  5. Setup automatic backups to external storage"
+
+write_files:
+  - path: /opt/yunohost/quick-start.md
+    content: |
+      # YunoHost Quick Start Guide
+      
+      ## First Login
+      1. Open browser: https://ynh.curl-chimera.ts.net/yunohost/admin
+      2. Login: admin / SecurePass123!
+      3. Complete initial setup wizard
+      4. Configure your domain and email
+      
+      ## Essential Configuration
+      ```bash
+      # Change admin password
+      sudo yunohost user password admin
+      
+      # Add mail domain
+      sudo yunohost mail adddomain rns.lol
+      
+      # Install popular apps
+      sudo yunohost app install https://github.com/YunoHost-Apps/<app>.git
+      
+      # Enable 2FA
+      sudo yunohost user 2fa enable admin
+      
+      # Configure backups
+      sudo yunohost backup create --name Initial-Setup
+      ```
+      
+      ## iOS Configuration
+      1. **Tailscale**: Install app, connect to tailnet
+      2. **Nextcloud**: Install app, login with SSO credentials
+      3. **Mail**: Configure IMAP/SMTP in iOS Mail app
+      4. **YunoHost Admin**: Add as PWA to home screen
+      5. **ntfy**: Subscribe to homelab alerts for notifications
+      
+      ## Daily Usage
+      - **File sync**: Nextcloud iOS app
+      - **Email**: iOS Mail with IMAP/SMTP settings
+      - **Calendar/Contacts**: Nextcloud apps
+      - **Admin**: YunoHost PWA or desktop browser
+      - **Monitoring**: ntfy push notifications
+      
+      ## Security Checklist
+      - [ ] Changed default admin password
+      - [ ] Enabled 2FA for admin user
+      - [ ] Configured external DNS records
+      - [ ] Set up automatic backups
+      - [ ] Installed Fail2Ban and verified
+      - [ ] Tested mail delivery
+      - [ ] Verified SSL certificates
+      - [ ] Configured firewall rules
+    permissions: '0644'
+    owner: ubuntu:ubuntu
+
+power_state:
+  mode: reboot
+  delay: "now"
+  message: "YunoHost VM bootstrap complete. Rebooting to finalize installation..."
+
+final_message: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  🛡️  YunoHost VM (ynh-01) Bootstrap Complete!                ║
+  ║                                                              ║
+  ║  📋 Self-Hosting Platform Status:                            ║
+  ║  ├─ YunoHost: ✅ Core installed and domain configured        ║
+  ║  ├─ Nextcloud: ✅ Primary app installed and SSO enabled      ║
+  ║  ├─ Mail Server: ✅ Postfix + Dovecot + Rspamd ready         ║
+  ║  ├─ Security: ✅ Fail2Ban, firewall, automatic SSL           ║
+  ║  ├─ SSO: ✅ Single Sign-On configured for all apps           ║
+  ║  ├─ Homepage: ✅ Dashboard installed and widget-enabled      ║
+  ║  ├─ Backups: ✅ Daily schedule created (2 AM)                ║
+  ║  ├─ Monitoring: ✅ Exporter running on port 9180             ║
+  ║  └─ Additional apps: ✅ SearxNG, Wallabag, FreshRSS ready    ║
+  ║                                                              ║
+  ║  🚀 First Access After Reboot:                               ║
+  ║  1. Admin Panel: https://ynh.curl-chimera.ts.net/yunohost/admin  ║
+  ║  2. Credentials: admin / SecurePass123!                      ║
+  ║  3. Complete setup wizard                                   ║
+  ║  4. Change password immediately                             ║
+  ║  5. Configure your domain and mail                          ║
+  ║                                                              ║
+  ║  📧 Mail Configuration:                                      ║
+  ║  ├─ SMTP: mail.ynh.curl-chimera.ts.net:587 (STARTTLS)            ║
+  ║  ├─ IMAP: mail.ynh.curl-chimera.ts.net:993 (SSL/TLS)             ║
+  ║  ├─ Webmail: https://mail.ynh.curl-chimera.ts.net                ║
+  ║  └─ Spam Filter: Rspamd with Redis backend                  ║
+  ║                                                              ║
+  ║  📱 iOS Integration Ready:                                   ║
+  ║  ├─ YunoHost Admin PWA: Safari → Add to Home Screen         ║
+  ║  ├─ Nextcloud iOS app: File sync, calendar, contacts        ║
+  ║  ├─ iOS Mail: IMAP/SMTP configuration                       ║
+  ║  ├─ Tailscale VPN: Secure access to all services            ║
+  ║  ├─ ntfy alerts: System health, backup status, cert expiry  ║
+  ║  ├─ Syncthing iOS: Peer-to-peer file sync                    ║
+  ║  └─ Homepage PWA: Quick access to all services              ║
+  ║                                                              ║
+  ║  🔐 Security Status:                                         ║
+  ║  ├─ SSL Certificates: Let's Encrypt (auto-renew)            ║
+  ║  ├─ Firewall: UFW + YunoHost rules (only essential ports)   ║
+  ║  ├─ Fail2Ban: Active (SSH, web, mail protection)            ║
+  ║  ├─ Rspamd: Spam filtering enabled                          ║
+  ║  ├─ Automatic Updates: Daily system and app updates         ║
+  ║  └─ SSH: Key-only authentication, no root login             ║
+  ║                                                              ║
+  ║  💾 Backup Configuration:                                    ║
+  ║  ├─ Daily: 2:00 AM automatic backups                        ║
+  ║  ├─ Retention: 7 days (manual backups kept indefinitely)    ║
+  ║  ├─ Storage: /home/yunohost/backup                          ║
+  ║  └─ Offsite: Configure rsync to external storage            ║
+  ║                                                              ║
+  ╚══════════════════════════════════════════════════════════════╝

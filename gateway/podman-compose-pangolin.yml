@@ -1,0 +1,145 @@
+version: "3.8"
+
+# Podman Compose for Pangolin - Adapted from flarescalin/charts/pangolin/templates/all.yaml
+# Advanced reverse proxy and authentication layer
+
+name: pangolin-gateway
+
+x-podman: &podman-common
+  security_opt:
+    - no-new-privileges:true
+  cap_add:
+    - NET_BIND_SERVICE
+  cap_drop:
+    - ALL
+  read_only: false
+  tmpfs:
+    - /tmp
+    - /run
+  sysctls:
+    - net.ipv4.ip_unprivileged_port_start=80
+  labels:
+    io.podman.compose.project: pangolin-gateway
+    io.podman.compose.version: "0.1"
+
+x-logging: &default-logging
+  driver: journald
+  options:
+    tag: "{{.Name}}"
+    mode: non-blocking
+    max-file: "5"
+    max-size: "10m"
+
+networks:
+  pangolin-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+          gateway: 172.30.1.1
+    enable_ipv6: false
+  gateway-net:
+    external: true
+  tailscale-net:
+    external: true
+  flarescalin-net:
+    external: true
+
+volumes:
+  pangolin-config:
+    driver: local
+  pangolin-data:
+    driver: local
+
+services:
+  # Pangolin main service - Adapted from Deployment in all.yaml
+  pangolin:
+    <<: *podman-common
+    image: fosrl/pangolin:latest
+    container_name: pangolin
+    restart: always
+    ports:
+      - "3001:3001"  # HTTP port from k8s service
+    volumes:
+      - pangolin-config:/app/config
+      - pangolin-data:/var/certificates
+      - /var/run/podman/podman.sock:/var/run/podman.sock:ro
+      - /opt/gateway/ssl:/ssl:ro
+    environment:
+      - TZ=${TZ}
+      # From flarescalin values (adapt as needed)
+      - PANGOLIN_PORT=3001
+      - PANGOLIN_HOST=pangolin.local
+      - PANGOLIN_LOG_LEVEL=INFO
+      - PANGOLIN_IMAGE_REPOSITORY=fosrl/pangolin
+      - PANGOLIN_IMAGE_TAG=latest
+      - PANGOLIN_IMAGE_PULL_POLICY=IfNotPresent
+      # Configuration from ConfigMap (empty data in template, customize)
+      - PANGOLIN_CONFIG_PATH=/app/config/config.yml
+      # Upstream services (adapt from k8s)
+      - PANGOLIN_UPSTREAMS=traefik:80,portainer:9000,ntfy:8080
+      # Authentication and security
+      - PANGOLIN_AUTH_METHOD=basic
+      - PANGOLIN_AUTH_USER=pangolin-admin
+      - PANGOLIN_AUTH_PASSWORD=SecurePangolinPass2024!
+      # Tailscale integration for secure proxying
+      - PANGOLIN_TAILSCALE_ENABLED=true
+      - PANGOLIN_TAILSCALE_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - PANGOLIN_TAILSCALE_INTERFACE=tailscale0
+      # Dynamic configuration
+      - PANGOLIN_DYNAMIC_PATH=/var/dynamic
+      # Replica count equivalent (single instance in Podman)
+      - PANGOLIN_REPLICA_COUNT=1
+      # Service type equivalent (ClusterIP -> local access)
+      - PANGOLIN_SERVICE_TYPE=local
+      - PANGOLIN_SERVICE_PORT=3001
+    networks:
+      - pangolin-net
+      - gateway-net
+      - tailscale-net
+      - flarescalin-net
+    labels:
+      # Labels adapted from k8s metadata
+      - "app.kubernetes.io/name=pangolin"
+      - "app.kubernetes.io/instance=pangolin"
+      - "cf.expose=true"
+      - "homepage.group=Infrastructure"
+      - "homepage.name=Pangolin"
+      - "homepage.icon=pangolin.png"
+      - "homepage.href=http://pangolin.local:3001"
+      - "homepage.description=Advanced reverse proxy with authentication"
+      # Traefik routing for Pangolin admin interface
+      - "traefik.enable=true"
+      - "traefik.http.routers.pangolin.rule=Host(`pangolin.local`)"
+      - "traefik.http.routers.pangolin.entrypoints=websecure"
+      - "traefik.http.services.pangolin.loadbalancer.server.port=3001"
+      # Health check (adapted from readinessProbe)
+      - "traefik.http.routers.pangolin-health.rule=Host(`pangolin.local`) && PathPrefix(`/api/v1/`)"
+      - "traefik.http.services.pangolin-health.loadbalancer.server.port=3001"
+      # Security middleware
+      - "traefik.http.middlewares.pangolin-admin.basicauth.users=pangolin-admin:$$2y$$05$$YOUR_PANGOLIN_HASH"
+      - "traefik.http.routers.pangolin.middlewares=pangolin-admin"
+    logging: *default-logging
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3001/api/v1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      # Adapted from k8s readinessProbe initialDelaySeconds: 5, periodSeconds: 10
+
+  # ConfigMap equivalent - Podman config volume for pangolin (empty data from template)
+  pangolin-config-init:
+    <<: *podman-common
+    image: busybox:1.36
+    container_name: pangolin-config-init
+    restart: "no"
+    command: ["sh", "-c", "echo 'data: {}' > /app/config/config.yml && chmod 644 /app/config/config.yml"]
+    volumes:
+      - pangolin-config:/app/config
+    networks:
+      - pangolin-net
+
+# Note: PersistentVolumeClaim (pangolin-data) is handled as named volume in Podman
+# The volume mount /var/certificates corresponds to the PVC in k8s
+# Service exposure via ports, no separate service resource needed

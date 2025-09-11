@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: etcd-local
+data:
+  etcd.yaml: |
+    listen-client-urls: https://127.0.0.1:2379,https://0.0.0.0:2379
+    advertise-client-urls: https://127.0.0.1:2379
+    listen-peer-urls: https://127.0.0.1:2380
+    initial-advertise-peer-urls: https://127.0.0.1:2380
+    initial-cluster: default=https://127.0.0.1:2380
+    initial-cluster-state: new
+    initial-cluster-token: olares-cluster
+    cert-file: /etc/etcd/tls/etcd-server.crt
+    key-file: /etc/etcd/tls/etcd-server.key
+    trusted-ca-file: /etc/etcd/tls/ca.crt
+    client-cert-auth: true
+    peer-cert-file: /etc/etcd/tls/etcd-peer.crt
+    peer-key-file: /etc/etcd/tls/etcd-peer.key
+    peer-client-cert-auth: true
+    peer-trusted-ca-file: /etc/etcd/tls/ca.crt

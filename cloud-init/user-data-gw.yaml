@@ -1,0 +1,971 @@
+#cloud-config
+# Gateway VM specific configuration (gw-01)
+# Extends common configuration
+
+# Import common configuration
+# This file should be merged with user-data-common.yaml during deployment
+
+hostname: gw-01
+fqdn: gw-01.homelab.local
+
+users:
+  - name: ubuntu
+    groups: [docker, podman, sudo, adm, systemd-journal]
+
+packages:
+  - docker.io
+  - docker-compose-v2
+  - podman
+  - cloudflared
+  - tailscale
+  - nginx
+  - certbot
+  - python3-certbot-nginx
+  - jq
+  - yq
+  - haproxy
+  - keepalived
+
+# Gateway-specific firewall rules
+ufw:
+  allow:
+    - 22/tcp     # SSH
+    - 80/tcp     # HTTP
+    - 443/tcp    # HTTPS
+    - 53/udp     # DNS
+    - 53/tcp     # DNS
+    - 41641/udp  # Tailscale
+    - 8080/tcp   # Health checks
+    - 9100/tcp   # Node Exporter
+    - 3000/tcp   # Homepage
+    - 8787/tcp   # Glance
+    - 8000/tcp   # CasaOS
+    - 5001/tcp   # Dockge
+    - 8081/tcp   # Cloudflared dashboard
+
+runcmd:
+  # Install and configure Docker
+  - |
+    if ! command -v docker >/dev/null 2>&1; then
+      echo "Installing Docker..."
+      curl -fsSL https://get.docker.com -o get-docker.sh
+      sh get-docker.sh
+      rm get-docker.sh
+      systemctl enable --now docker
+      usermod -aG docker ubuntu
+    fi
+  
+  # Install and configure Podman
+  - |
+    if ! command -v podman >/dev/null 2>&1; then
+      echo "Installing Podman..."
+      . /etc/os-release
+      . /etc/lsb-release
+      apt-get install -y podman
+      usermod -aG podman ubuntu
+    fi
+  
+  # Configure Tailscale (gateway role)
+  - |
+    if command -v tailscale >/dev/null 2>&1; then
+      echo "Configuring Tailscale gateway..."
+      tailscale up \\
+        --authkey={{.TAILSCALE_AUTHKEY}} \\
+        --hostname=gw-01 \\
+        --advertise-routes=192.168.1.0/24,10.0.0.0/8 \\
+        --advertise-exit-node \\
+        --accept-routes \\
+        --accept-dns=false \\
+        --state=/var/lib/tailscale/tailscaled.state \\
+        --socket=/var/run/tailscale/tailscaled.sock
+      systemctl enable --now tailscaled
+      systemctl restart tailscaled
+    fi
+  
+  # Install Cloudflared
+  - |
+    if ! command -v cloudflared >/dev/null 2>&1; then
+      echo "Installing Cloudflared..."
+      curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+      dpkg -i cloudflared.deb
+      rm cloudflared.deb
+      systemctl enable cloudflared
+    fi
+  
+  # Create gateway directories
+  - |
+    mkdir -p /opt/gateway/{compose,config,ssl,certs,backups}
+    mkdir -p /var/lib/cloudflared
+    chown -R ubuntu:ubuntu /opt/gateway
+    chmod 755 /opt/gateway/{compose,config}
+    chmod 700 /opt/gateway/{ssl,certs}
+  
+  # Initial Cloudflared tunnel setup
+  - |
+    if [ -f /opt/gateway/config/tunnel.json ]; then
+      echo "Cloudflared tunnel config exists"
+    else
+      echo "Creating initial Cloudflared tunnel config..."
+      cat > /opt/gateway/config/tunnel.json << 'EOF'
+      {
+        "accountTag": "{{.CLOUDFLARE_ACCOUNT_ID}}",
+        "tunnelSecret": "{{.CLOUDFLARE_TUNNEL_SECRET}}",
+        "tunnelID": "{{.CLOUDFLARE_TUNNEL_ID}}"
+      }
+      EOF
+      chown ubuntu:ubuntu /opt/gateway/config/tunnel.json
+    fi
+  
+  # Setup nginx for local routing
+  - |
+    cat > /etc/nginx/sites-available/homelab << 'EOF'
+    # Homelab local proxy configuration
+    upstream homepage {
+        server 127.0.0.1:3000;
+    }
+    upstream glance {
+        server 127.0.0.1:8787;
+    }
+    upstream casaos {
+        server 127.0.0.1:8000;
+    }
+    
+    server {
+        listen 80;
+        server_name localhost;
+        
+        # Homepage
+        location /homepage/ {
+            proxy_pass http://homepage/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+        
+        # Glance
+        location /glance/ {
+            proxy_pass http://glance/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+        
+        # CasaOS
+        location /casaos/ {
+            proxy_pass http://casaos/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+    EOF
+    
+    ln -sf /etc/nginx/sites-available/homelab /etc/nginx/sites-enabled/default
+    systemctl enable --now nginx
+    nginx -t && systemctl restart nginx || echo "Nginx config test failed"
+  
+  # Create initial Docker Compose file for gateway services
+  - |
+    cat > /opt/gateway/compose/docker-compose.yaml << 'EOF'
+    version: "3.9"
+    name: homelab-gateway
+    
+    x-logging: &default-logging
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    networks:
+      homelab:
+        driver: bridge
+        ipam:
+          config:
+            - subnet: 172.20.0.0/16
+      tailscale:
+        driver: bridge
+        external: true
+    
+    volumes:
+      cloudflared-config:
+      cloudflared-creds:
+      homepage-config:
+      glance-config:
+      casaos-data:
+      dokploy-data:
+      ntfy-data:
+      traefik-data:
+    
+    services:
+      # Cloudflared tunnel
+      cloudflared:
+        image: cloudflare/cloudflared:latest
+        container_name: cloudflared
+        restart: unless-stopped
+        network_mode: host
+        command: tunnel --no-autoupdate run
+        environment:
+          - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+        volumes:
+          - /opt/gateway/config:/etc/cloudflared:ro
+          - cloudflared-config:/etc/cloudflared
+          - cloudflared-creds:/etc/cloudflared/creds
+        logging: *default-logging
+        healthcheck:
+          test: ["CMD", "cloudflared", "tunnel", "info"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+    
+      # Homepage dashboard
+      homepage:
+        image: ghcr.io/gethomepage/homepage:v0.10.3
+        container_name: homepage
+        restart: unless-stopped
+        ports:
+          - "3000:3000"
+        volumes:
+          - /opt/gateway/config/homepage:/app/config
+          - /var/run/docker.sock:/var/run/docker.sock:ro
+          - /opt/gateway/compose:/compose:ro
+        environment:
+          - HOMEPAGE_ALLOWED_HOSTS=0.0.0.0/0
+          - PUID=1000
+          - PGID=1000
+        networks:
+          - homelab
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.homepage.rule=Host(`homepage.local`)"
+          - "traefik.http.routers.homepage.entrypoints=web"
+          - "traefik.http.services.homepage.loadbalancer.server.port=3000"
+        logging: *default-logging
+        healthcheck:
+          test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+    
+      # Glance media dashboard
+      glance:
+        image: glanceapp/glance:latest
+        container_name: glance
+        restart: unless-stopped
+        ports:
+          - "8787:8787"
+        volumes:
+          - /opt/gateway/config/glance:/data
+          - /opt/media:/media:ro
+        environment:
+          - PORT=8787
+          - BASE_URL=/glance
+          - ENABLE_AUTH=true
+          - USERNAME=admin
+          - PASSWORD=homelab2024
+        networks:
+          - homelab
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.glance.rule=Host(`glance.local`) || PathPrefix(`/glance`)"
+          - "traefik.http.routers.glance.entrypoints=web"
+          - "traefik.http.services.glance.loadbalancer.server.port=8787"
+        logging: *default-logging
+        healthcheck:
+          test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8787"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+    
+      # CasaOS app store
+      casaos:
+        image: casaos/casaos:latest
+        container_name: casaos
+        restart: unless-stopped
+        ports:
+          - "8000:80"
+        volumes:
+          - casaos-data:/DATA
+          - /etc/passwd:/etc/passwd:ro
+          - /etc/group:/etc/group:ro
+          - /opt/media:/mnt/media
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+        networks:
+          - homelab
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.casaos.rule=Host(`casaos.local`) || PathPrefix(`/casaos`)"
+          - "traefik.http.routers.casaos.entrypoints=web"
+          - "traefik.http.services.casaos.loadbalancer.server.port=80"
+        logging: *default-logging
+        healthcheck:
+          test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+    
+      # Dokploy deployment platform
+      dokploy:
+        image: dokploy/dokploy:latest
+        container_name: dokploy
+        restart: unless-stopped
+        ports:
+          - "3001:3000"
+        volumes:
+          - dokploy-data:/app/data
+          - /var/run/docker.sock:/var/run/docker.sock
+        environment:
+          - DOKPLOY_PORT=3001
+          - DOKPLOY_HOST=dokploy.local
+          - NODE_ENV=production
+        networks:
+          - homelab
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.dokploy.rule=Host(`dokploy.local`)"
+          - "traefik.http.routers.dokploy.entrypoints=web"
+          - "traefik.http.services.dokploy.loadbalancer.server.port=3000"
+        logging: *default-logging
+        healthcheck:
+          test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+    
+      # ntfy notifications server
+      ntfy:
+        image: binwiederhier/ntfy:latest
+        container_name: ntfy
+        restart: unless-stopped
+        ports:
+          - "8080:80"
+        volumes:
+          - ntfy-data:/etc/ntfy
+          - /var/cache/ntfy:/var/cache/ntfy
+        environment:
+          - NTFY_AUTH_FILE=/etc/ntfy/user.db
+          - NTFY_BEHIND_PROXY=true
+          - NTFY_WEB_ROOT=http://localhost:8080
+        networks:
+          - homelab
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.ntfy.rule=Host(`ntfy.local`) || PathPrefix(`/ntfy`)"
+          - "traefik.http.routers.ntfy.entrypoints=web"
+          - "traefik.http.services.ntfy.loadbalancer.server.port=80"
+        logging: *default-logging
+        healthcheck:
+          test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/version"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+    
+      # Traefik reverse proxy
+      traefik:
+        image: traefik:v3.0
+        container_name: traefik
+        restart: unless-stopped
+        ports:
+          - "80:80"
+          - "8080:8080"
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock:ro
+          - traefik-data:/data
+          - /opt/gateway/ssl:/ssl:ro
+        environment:
+          - TRAEFIK_API=true
+          - TRAEFIK_API_DASHBOARD=true
+          - TRAEFIK_PROVIDERS_DOCKER=true
+          - TRAEFIK_PROVIDERS_DOCKER_EXPOSEDBYDEFAULT=false
+          - TRAEFIK_PROVIDERS_FILE_DIRECTORY=/data/dynamic
+          - TRAEFIK_ENTRYPOINTS_WEB_ADDRESS=:80
+          - TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS=:443
+          - TRAEFIK_LOG_LEVEL=INFO
+        networks:
+          - homelab
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.traefik.rule=Host(`traefik.local`)"
+          - "traefik.http.routers.traefik.service=api@internal"
+          - "traefik.http.routers.traefik.entrypoints=web"
+        command:
+          - --api.dashboard=true
+          - --providers.docker=true
+          - --providers.docker.exposedbydefault=false
+          - --providers.file.directory=/data/dynamic
+          - --providers.file.watch=true
+          - --entrypoints.web.address=:80
+          - --entrypoints.web.http.redirections.entryPoint.to=websecure
+          - --entrypoints.web.http.redirections.entryPoint.scheme=https
+          - --entrypoints.websecure.address=:443
+          - --entrypoints.websecure.http.tls.certresolver=letsencrypt
+          - --certificatesresolvers.letsencrypt.acme.email=admin@homelab.local
+          - --certificatesresolvers.letsencrypt.acme.storage=/data/acme.json
+          - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+        logging: *default-logging
+        healthcheck:
+          test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/ping"]
+          interval: 30s
+          timeout: 10s
+          retries: 3
+          start_period: 40s
+    
+    EOF
+    chown ubuntu:ubuntu /opt/gateway/compose/docker-compose.yaml
+    chmod 644 /opt/gateway/compose/docker-compose.yaml
+  
+  # Create initial configuration files
+  - |
+    # Homepage config
+    mkdir -p /opt/gateway/config/homepage
+    cat > /opt/gateway/config/homepage/config.yml << 'EOF'
+    ---
+    # Homepage Configuration
+    title: Homelab Dashboard
+    
+    # Theme
+    theme: dark
+    
+    # Layout
+    layout: 
+      Home:
+        style: row
+        items: 3
+    
+    # Services
+    services:
+      - Media:
+          - Glance:
+              icon: glance.png
+              href: http://glance.local
+              description: Media library preview
+          - Plex:
+              icon: plex.png
+              href: http://plex.local:32400/web
+              description: Media streaming
+      - Applications:
+          - Nextcloud:
+              icon: nextcloud.png
+              href: https://nextcloud.local
+              description: File sync and collaboration
+          - Homepage:
+              icon: homepage.png
+              href: http://localhost:3000
+              description: This dashboard
+      - Infrastructure:
+          - Proxmox:
+              icon: proxmox.png
+              href: https://proxmox.local:8006
+              description: Virtualization host
+          - Prometheus:
+              icon: prometheus.png
+              href: http://prometheus.local:9090
+              description: Monitoring system
+          - Grafana:
+              icon: grafana.png
+              href: http://grafana.local:3000
+              description: Monitoring dashboards
+    
+    # Widgets
+    widgets:
+      - resources:
+          resource: cpu
+          label: CPU Usage
+      - resources:
+          resource: memory
+          label: Memory Usage
+      - resources:
+          resource: disk
+          label: Disk Usage
+          arguments:
+            path: /
+      - uptime_kuma:
+          server: http://uptime.local:3001
+          apikey: your-uptime-api-key
+    EOF
+    chown -R ubuntu:ubuntu /opt/gateway/config/homepage
+    
+    # Glance config
+    cat > /opt/gateway/config/glance/config.json << 'EOF'
+    {
+      "port": 8787,
+      "baseUrl": "/glance",
+      "enableAuth": true,
+      "username": "admin",
+      "password": "homelab2024",
+      "providers": [
+        {
+          "name": "Local Media",
+          "type": "local",
+          "path": "/opt/media",
+          "recursive": true
+        },
+        {
+          "name": "Plex Library",
+          "type": "plex",
+          "url": "http://plex.local:32400",
+          "token": "your-plex-token"
+        }
+      ],
+      "theme": "dark",
+      "cache": 3600
+    }
+    EOF
+    chown ubuntu:ubuntu /opt/gateway/config/glance/config.json
+    
+    # ntfy config
+    cat > /opt/gateway/config/ntfy/server.yml << 'EOF'
+    # ntfy server configuration
+    auth-file: /etc/ntfy/user.db
+    
+    # Web server
+    listen-http: :80
+    behind-proxy: true
+    web-root: http://localhost:8080
+    
+    # Database
+    database: sqlite:///var/lib/ntfy/ntfy.db
+    
+    # Cache
+    cache-duration: 12h
+    cache-ttl-best-effort: 12h
+    
+    # Attachments
+    max-file-size: 25MB
+    keep-alive: 30s
+    
+    # Pushover integration (for iOS alerts)
+    pushover:
+      token: your-pushover-app-token
+      user: your-pushover-user-key
+    
+    # Firebase (Android)
+    firebase:
+      enabled: false
+      credentials: /etc/ntfy/firebase-credentials.json
+    
+    # Access control
+    auth-default-access: authenticated
+    auth-default-subscription: deny
+    allow-signing-key: true
+    
+    # Message limits
+    max-messages: 1000
+    max-subscribers: 500
+    
+    # Security
+    cors-origins: "*"
+    cors-methods: GET,POST,PUT,DELETE,OPTIONS
+    cors-headers: Content-Type,Authorization,X-Requested-With
+    
+    # Logging
+    log-level: info
+    log-format: json
+    log-encoder: json
+    EOF
+    chown ubuntu:ubuntu /opt/gateway/config/ntfy/server.yml
+  
+  # Create Cloudflared tunnel configuration
+  - |
+    mkdir -p /opt/gateway/config/cloudflared
+    cat > /opt/gateway/config/cloudflared/config.yml << 'EOF'
+    # Cloudflared tunnel configuration
+    tunnel: homelab-gateway
+    credentials-file: /etc/cloudflared/homelab-gateway.json
+    
+    ingress:
+      # Homepage dashboard
+      - hostname: homepage.rns.lol
+        service: http://localhost:3000
+        originRequest:
+          noTLSVerify: true
+      
+      # Glance media
+      - hostname: glance.rns.lol
+        service: http://localhost:8787
+        originRequest:
+          noTLSVerify: true
+      
+      # CasaOS app store
+      - hostname: casaos.rns.lol
+        service: http://localhost:8000
+        originRequest:
+          noTLSVerify: true
+      
+      # Dokploy deployments
+      - hostname: dokploy.rns.lol
+        service: http://localhost:3001
+        originRequest:
+          noTLSVerify: true
+      
+      # ntfy notifications
+      - hostname: ntfy.rns.lol
+        service: http://localhost:8080
+        originRequest:
+          noTLSVerify: true
+      
+      # Traefik dashboard
+      - hostname: traefik.rns.lol
+        service: http://localhost:8080
+        originRequest:
+          noTLSVerify: true
+      
+      # Catch-all
+      - service: http_status:404
+    
+    # Warp routing (optional)
+    warp-routing:
+      enabled: true
+    
+    # Logging
+    loglevel: info
+    logfile: /var/log/cloudflared.log
+    
+    # Metrics
+    metrics: 0.0.0.0:8081
+    EOF
+    chown ubuntu:ubuntu /opt/gateway/config/cloudflared/config.yml
+  
+  # Setup initial service discovery watcher
+  - |
+    cat > /opt/gateway/service-discovery.py << 'EOF'
+    #!/usr/bin/env python3
+    """
+    Homelab Service Discovery Watcher
+    Monitors Docker containers and updates Cloudflared configuration
+    """
+    import docker
+    import yaml
+    import os
+    import time
+    import logging
+    from datetime import datetime
+    
+    # Configuration
+    CONFIG_DIR = '/opt/gateway/config'
+    COMPOSE_DIR = '/opt/gateway/compose'
+    CLOUDFLARED_CONFIG = f'{CONFIG_DIR}/cloudflared/config.yml'
+    DOMAIN = os.getenv('DOMAIN', 'rns.lol')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('/var/log/service-discovery.log'),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    
+    class ServiceDiscovery:
+        def __init__(self):
+            self.client = docker.from_env()
+            self.domain = DOMAIN
+            self.ingress_rules = []
+        
+        def get_services(self):
+            """Discover services from Docker containers"""
+            services = []
+            try:
+                containers = self.client.containers.list(all=True)
+                for container in containers:
+                    labels = container.labels or {}
+                    if labels.get('cf.expose', 'false').lower() == 'true':
+                        service_name = labels.get('homepage.name', container.name).lower().replace(' ', '-')
+                        port = self._get_port(container)
+                        if port:
+                            services.append({
+                                'name': service_name,
+                                'port': port,
+                                'hostname': f'{service_name}.{self.domain}',
+                                'container': container.name,
+                                'group': labels.get('homepage.group', 'Uncategorized'),
+                                'description': labels.get('homepage.description', '')
+                            })
+                return services
+            except Exception as e:
+                logger.error(f"Error discovering services: {e}")
+                return []
+        
+        def _get_port(self, container):
+            """Extract published port from container"""
+            try:
+                ports = container.attrs['NetworkSettings']['Ports']
+                for port in ports:
+                    if port:
+                        return list(ports[port])[0].split(':')[0]
+                return None
+            except Exception as e:
+                logger.error(f"Error getting port for {container.name}: {e}")
+                return None
+        
+        def update_cloudflared_config(self, services):
+            """Update Cloudflared configuration with discovered services"""
+            try:
+                config = {
+                    'tunnel': 'homelab-gateway',
+                    'credentials-file': '/etc/cloudflared/homelab-gateway.json',
+                    'ingress': [],
+                    'warp-routing': {'enabled': True},
+                    'loglevel': 'info',
+                    'metrics': '0.0.0.0:8081'
+                }
+                
+                # Add discovered services
+                for service in services:
+                    config['ingress'].append({
+                        'hostname': service['hostname'],
+                        'service': f'http://localhost:{service["port"]}',
+                        'originRequest': {'noTLSVerify': True}
+                    })
+                
+                # Add catch-all rule
+                config['ingress'].append({'service': 'http_status:404'})
+                
+                # Write config
+                with open(CLOUDFLARED_CONFIG, 'w') as f:
+                    yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+                
+                # Restart Cloudflared
+                os.system('systemctl restart cloudflared')
+                
+                logger.info(f"Updated Cloudflared config with {len(services)} services")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error updating Cloudflared config: {e}")
+                return False
+        
+        def update_homepage_config(self, services):
+            """Update Homepage configuration with discovered services"""
+            try:
+                homepage_config = {
+                    'title': 'Homelab Dashboard',
+                    'theme': 'dark',
+                    'layout': {'Home': {'style': 'row', 'items': 3}},
+                    'services': {}
+                }
+                
+                # Group services
+                groups = {}
+                for service in services:
+                    group = service['group']
+                    if group not in groups:
+                        groups[group] = []
+                    groups[group].append({
+                        'name': service['name'].title(),
+                        'icon': f"{service['name']}.png",
+                        'href': f"http://{service['hostname']}",
+                        'description': service['description']
+                    })
+                
+                # Build services structure
+                for group, items in groups.items():
+                    homepage_config['services'][group] = items
+                
+                # Write config
+                config_path = f"{CONFIG_DIR}/homepage/config.yml"
+                with open(config_path, 'w') as f:
+                    yaml.dump(homepage_config, f, default_flow_style=False, sort_keys=False)
+                
+                # Restart Homepage
+                os.system('docker compose -f /opt/gateway/compose/docker-compose.yaml restart homepage')
+                
+                logger.info(f"Updated Homepage config with {len(services)} services")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Error updating Homepage config: {e}")
+                return False
+        
+        def run(self):
+            """Main discovery loop"""
+            logger.info("Starting service discovery watcher...")
+            while True:
+                try:
+                    services = self.get_services()
+                    if services:
+                        self.update_cloudflared_config(services)
+                        self.update_homepage_config(services)
+                        logger.info(f"Discovered {len(services)} services: {[s['name'] for s in services]}")
+                    else:
+                        logger.warning("No services discovered")
+                    
+                    # Wait 30 seconds before next scan
+                    time.sleep(30)
+                    
+                except KeyboardInterrupt:
+                    logger.info("Service discovery stopped by user")
+                    break
+                except Exception as e:
+                    logger.error(f"Discovery loop error: {e}")
+                    time.sleep(60)  # Wait longer on error
+    
+    if __name__ == "__main__":
+        discovery = ServiceDiscovery()
+        discovery.run()
+    EOF
+    
+    chmod +x /opt/gateway/service-discovery.py
+    chown ubuntu:ubuntu /opt/gateway/service-discovery.py
+  
+  # Create systemd service for service discovery
+  - |
+    cat > /etc/systemd/system/homelab-discovery.service << 'EOF'
+    [Unit]
+    Description=Homelab Service Discovery Watcher
+    After=network-online.target docker.service
+    Wants=network-online.target
+    Requires=docker.service
+    
+    [Service]
+    Type=simple
+    User=ubuntu
+    Group=ubuntu
+    WorkingDirectory=/opt/gateway
+    ExecStart=/usr/bin/python3 /opt/gateway/service-discovery.py
+    Restart=always
+    RestartSec=10
+    LimitNOFILE=65536
+    Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    Environment=DOMAIN=rns.lol
+    
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    
+    systemctl daemon-reload
+    systemctl enable homelab-discovery
+    systemctl start homelab-discovery
+  
+  # Setup log rotation
+  - |
+    cat > /etc/logrotate.d/homelab << 'EOF'
+    /var/log/homelab/*.log /var/log/applications/*.log {
+        daily
+        missingok
+        rotate 14
+        compress
+        delaycompress
+        notifempty
+        create 0640 ubuntu ubuntu
+        postrotate
+            /bin/systemctl reload nginx >/dev/null 2>&1 || true
+            /bin/kill -HUP `cat /var/run/nginx.pid 2>/dev/null` 2>/dev/null || true
+        endscript
+    }
+    EOF
+  
+  # Final health check
+  - |
+    echo "Gateway VM bootstrap complete!"
+    echo "Services to verify:"
+    echo "  - Tailscale: tailscale status"
+    echo "  - Docker: docker ps"
+    echo "  - Cloudflared: cloudflared tunnel info"
+    echo "  - Node Exporter: curl localhost:9100/metrics"
+    echo "  - Firewall: ufw status verbose"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Configure Cloudflare tunnel token in /opt/gateway/config"
+    echo "  2. Update domain in /opt/gateway/service-discovery.py"
+    echo "  3. Run: docker compose -f /opt/gateway/compose/docker-compose.yaml up -d"
+    echo "  4. Access Homepage at http://localhost:3000"
+
+write_files:
+  - path: /opt/gateway/README.md
+    content: |
+      # Gateway VM (gw-01) Setup Guide
+      
+      ## Overview
+      This VM serves as the central networking and service discovery hub for the homelab.
+      
+      ## Services Running
+      - Cloudflared: Public tunnel to Cloudflare network
+      - Homepage: Unified dashboard
+      - Glance: Media library preview
+      - CasaOS: App store and management
+      - Dokploy: Deployment platform
+      - ntfy: Push notifications
+      - Traefik: Reverse proxy
+      - Node Exporter: System metrics
+      
+      ## Configuration Files
+      - `/opt/gateway/compose/docker-compose.yaml` - Main services
+      - `/opt/gateway/config/cloudflared/` - Tunnel configuration
+      - `/opt/gateway/config/homepage/` - Dashboard config
+      - `/opt/gateway/service-discovery.py` - Auto-discovery script
+      
+      ## Environment Variables
+      Set these in `/opt/gateway/compose/.env`:
+      ```
+      DOMAIN=rns.lol
+      CLOUDFLARE_TUNNEL_TOKEN=your-tunnel-token
+      CLOUDFLARE_ACCOUNT_ID=your-account-id
+      ```
+      
+      ## Quick Start
+      1. Edit `.env` with your domain and Cloudflare credentials
+      2. `cd /opt/gateway && docker compose up -d`
+      3. Configure Cloudflared tunnel: `cloudflared tunnel route dns homelab-gateway rns.lol`
+      4. Verify services: `docker compose ps`
+      5. Access Homepage: http://homepage.rns.lol
+      
+      ## Service Discovery
+      The `homelab-discovery` service automatically:
+      - Scans Docker containers for `cf.expose=true` labels
+      - Updates Cloudflared ingress rules
+      - Regenerates Homepage configuration
+      - Restarts affected services
+    permissions: '0644'
+    owner: ubuntu:ubuntu
+
+power_state:
+  mode: reboot
+  delay: "now"
+  message: "Gateway VM bootstrap complete. Rebooting to finalize networking setup..."
+
+final_message: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  🚀 Gateway VM (gw-01) Bootstrap Complete!                   ║
+  ║                                                              ║
+  ║  📋 What was configured:                                     ║
+  ║  ├─ Docker, Podman, Cloudflared, Nginx installed             ║
+  ║  ├─ Tailscale configured as exit node and route advertiser   ║
+  ║  ├─ Service discovery watcher started                        ║
+  ║  ├─ Initial Docker Compose file created                      ║
+  ║  ├─ Cloudflared tunnel configuration ready                   ║
+  ║  ├─ Homepage, Glance, CasaOS configs prepared                ║
+  ║  └─ ntfy server ready for push notifications                 ║
+  ║                                                              ║
+  ║  🔧 Next Steps After Reboot:                                 ║
+  ║  1. Edit /opt/gateway/compose/.env with your domain          ║
+  ║  2. Set Cloudflare tunnel token in environment               ║
+  ║  3. cd /opt/gateway && docker compose up -d                  ║
+  ║  4. cloudflared tunnel route dns homelab-gateway *.domain.com║
+  ║  5. Verify: docker compose ps && tailscale status            ║
+  ║                                                              ║
+  ║  🌐 Access URLs (after compose up):                          ║
+  ║  ├─ Homepage: http://homepage.rns.lol                 ║
+  ║  ├─ Glance: http://glance.rns.lol                     ║
+  ║  ├─ CasaOS: http://casaos.rns.lol                     ║
+  ║  ├─ Traefik: http://traefik.rns.lol                   ║
+  ║  └─ ntfy: http://ntfy.rns.lol                         ║
+  ║                                                              ║
+  ║  📱 iOS Integration:                                         ║
+  ║  ├─ ntfy app subscribed to "homelab" topic for alerts        ║
+  ║  ├─ Tailscale app for VPN access                            ║
+  ║  └─ Homepage PWA for dashboard access                        ║
+  ║                                                              ║
+  ╚══════════════════════════════════════════════════════════════╝

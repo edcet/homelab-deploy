@@ -1,0 +1,20 @@
+- op: replace
+  path: /spec/replicas
+  value: 1
+target:
+  kind: Deployment
+  name: prometheus-operator
+---
+- op: replace
+  path: /spec/replicas
+  value: 1
+target:
+  kind: Deployment
+  name: grafana
+---
+- op: replace
+  path: /spec/replicas
+  value: 1
+target:
+  kind: StatefulSet
+  name: prometheus-kube-prometheus-prometheus

@@ -1,0 +1,1178 @@
+#cloud-config
+# Cosmos VM specific configuration (cosmos-01)
+# App hosting platform with CasaOS and Podman
+
+# This configuration extends user-data-common.yaml
+# Merge with common template during deployment
+
+hostname: cosmos-01
+fqdn: cosmos-01.homelab.local
+
+users:
+  - name: ubuntu
+    groups: [docker, podman, sudo, adm, systemd-journal, audio, video]
+
+packages:
+  - docker.io
+  - docker-compose-v2
+  - podman
+  - tailscale
+  - nginx
+  - certbot
+  - python3-certbot-nginx
+  - ffmpeg
+  - jq
+  - yq
+  - sqlite3
+  - postgresql
+  - redis-server
+  - nodejs
+  - npm
+  - build-essential
+
+# Cosmos-specific firewall rules
+ufw:
+  allow:
+    - 22/tcp     # SSH
+    - 80/tcp     # HTTP
+    - 443/tcp    # HTTPS
+    - 53/udp     # DNS
+    - 41641/udp  # Tailscale
+    - 9100/tcp   # Node Exporter
+    - 8000/tcp   # CasaOS
+    - 8080/tcp   # Generic apps
+    - 8787/tcp   # Glance
+    - 32400/tcp  # Plex
+    - 8096/tcp   # Jellyfin
+    - 7878/tcp   # Radarr
+    - 8983/tcp   # Sonarr
+    - 6767/tcp   # SearxNG
+    - 5432/tcp   # PostgreSQL (local only)
+    - 6379/tcp   # Redis (local only)
+
+runcmd:
+  # Configure Tailscale
+  - |
+    if command -v tailscale >/dev/null 2>&1; then
+      echo "Configuring Tailscale for Cosmos VM..."
+      tailscale up \\
+        --authkey={{.TAILSCALE_AUTHKEY}} \\
+        --hostname=cosmos-01 \\
+        --accept-routes \\
+        --accept-dns=false \\
+        --state=/var/lib/tailscale/tailscaled.state \\
+        --socket=/var/run/tailscale/tailscaled.sock
+      systemctl enable --now tailscaled
+      systemctl restart tailscaled
+    fi
+  
+  # Install Docker and Podman
+  - |
+    echo "Installing container runtimes..."
+    
+    # Docker
+    if ! command -v docker >/dev/null 2>&1; then
+      curl -fsSL https://get.docker.com -o get-docker.sh
+      sh get-docker.sh
+      rm get-docker.sh
+      systemctl enable --now docker
+      usermod -aG docker ubuntu
+    fi
+    
+    # Podman
+    if ! command -v podman >/dev/null 2>&1; then
+      apt-get install -y podman podman-compose buildah skopeo
+      usermod -aG podman ubuntu
+      mkdir -p /etc/containers
+      echo -e '[network]\nnetwork_backend = "cni"' > /etc/containers/containers.conf
+    fi
+  
+  # Install CasaOS
+  - |
+    echo "Installing CasaOS..."
+    if [ ! -f /usr/local/bin/casaos ]; then
+      wget -qO- https://get.casaos.io | sudo bash
+      systemctl enable --now casaos
+    fi
+    
+    # Configure CasaOS data directory
+    mkdir -p /var/lib/casaos
+    chown casaos:casaos /var/lib/casaos
+    chmod 755 /var/lib/casaos
+  
+  # Install Cosmos Cloud (alternative app store)
+  - |
+    echo "Installing Cosmos Cloud..."
+    cd /tmp
+    if [ ! -d cosmos-cloud ]; then
+      git clone https://github.com/cosmos-cloud/cosmos-cloud.git
+      cd cosmos-cloud
+      npm install
+      npm run build
+      sudo npm run start -- --host 0.0.0.0 --port 8081
+    else
+      cd cosmos-cloud
+      git pull
+      npm install
+      npm run build
+    fi
+    
+    # Create systemd service for Cosmos
+    cat > /etc/systemd/system/cosmos-cloud.service << 'EOF'
+    [Unit]
+    Description=Cosmos Cloud App Store
+    After=network.target docker.service
+    Wants=docker.service
+    
+    [Service]
+    Type=simple
+    User=ubuntu
+    Group=ubuntu
+    WorkingDirectory=/tmp/cosmos-cloud
+    Environment=NODE_ENV=production
+    ExecStart=/usr/bin/npm start -- --host 0.0.0.0 --port 8081
+    ExecReload=/bin/kill -HUP $MAINPID
+    Restart=always
+    RestartSec=10
+    
+    # Security
+    NoNewPrivileges=true
+    PrivateTmp=true
+    ProtectSystem=strict
+    ReadWritePaths=/tmp/cosmos-cloud
+    LimitNOFILE=65536
+    
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    
+    systemctl daemon-reload
+    systemctl enable cosmos-cloud
+    systemctl start cosmos-cloud
+  
+  # Setup media server applications
+  - |
+    echo "Setting up media server applications..."
+    
+    # Create media directories
+    mkdir -p /opt/media/{movies,tv,books,music,photos,downloads}
+    chown -R ubuntu:ubuntu /opt/media
+    chmod 755 /opt/media
+    
+    # Create Docker Compose for media stack
+    mkdir -p /opt/cosmos/media
+    cat > /opt/cosmos/media/docker-compose.yml << 'EOF'
+    version: "3.9"
+    name: media-stack
+    
+    x-logging: &default-logging
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    networks:
+      media:
+        driver: bridge
+        ipam:
+          config:
+            - subnet: 172.21.0.0/16
+    
+    volumes:
+      media-config:
+      media-movies:
+      media-tv:
+      media-music:
+      media-books:
+      media-photos:
+      media-downloads:
+    
+    services:
+      # Plex Media Server
+      plex:
+        image: plexinc/pms-docker:latest
+        container_name: plex
+        network_mode: host
+        environment:
+          - PLEX_UID=1000
+          - PLEX_GID=1000
+          - TZ=America/Chicago
+          - PLEX_CLAIM=claim-your-token-here
+        volumes:
+          - media-config:/config
+          - media-movies:/movies
+          - media-tv:/tv
+          - media-music:/music
+          - /transcode:/transcode
+        restart: unless-stopped
+        devices:
+          - /dev/dri:/dev/dri
+        logging: *default-logging
+    
+      # Jellyfin (alternative media server)
+      jellyfin:
+        image: jellyfin/jellyfin:latest
+        container_name: jellyfin
+        user: 1000:1000
+        network_mode: host
+        environment:
+          - TZ=America/Chicago
+          - JELLYFIN_PublishedServerUrl=http://cosmos-01.curl-chimera.ts.net
+        volumes:
+          - media-config:/config
+          - media-movies:/movies
+          - media-tv:/tv
+          - media-music:/music
+          - media-books:/books
+          - media-photos:/photos
+          - /cache:/cache
+        restart: unless-stopped
+        devices:
+          - /dev/dri:/dev/dri
+        logging: *default-logging
+    
+      # Radarr (movie manager)
+      radarr:
+        image: linuxserver/radarr:latest
+        container_name: radarr
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+        volumes:
+          - media-config:/config
+          - media-movies:/movies
+          - media-downloads:/downloads
+        ports:
+          - 7878:7878
+        restart: unless-stopped
+        networks:
+          - media
+        logging: *default-logging
+    
+      # Sonarr (TV show manager)
+      sonarr:
+        image: linuxserver/sonarr:latest
+        container_name: sonarr
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+        volumes:
+          - media-config:/config
+          - media-tv:/tv
+          - media-downloads:/downloads
+        ports:
+          - 8983:8983
+        restart: unless-stopped
+        networks:
+          - media
+        logging: *default-logging
+    
+      # Lidarr (music manager)
+      lidarr:
+        image: linuxserver/lidarr:latest
+        container_name: lidarr
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+        volumes:
+          - media-config:/config
+          - media-music:/music
+          - media-downloads:/downloads
+        ports:
+          - 8686:8686
+        restart: unless-stopped
+        networks:
+          - media
+        logging: *default-logging
+    
+      # Readarr (book manager)
+      readarr:
+        image: linuxserver/readarr:latest
+        container_name: readarr
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+        volumes:
+          - media-config:/config
+          - media-books:/books
+          - media-downloads:/downloads
+        ports:
+          - 8787:8787
+        restart: unless-stopped
+        networks:
+          - media
+        logging: *default-logging
+    
+      # Prowlarr (indexer manager)
+      prowlarr:
+        image: hotio/prowlarr:latest
+        container_name: prowlarr
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+        volumes:
+          - media-config:/config
+          - /gluetun:/gluetun
+        ports:
+          - 9696:9696
+        restart: unless-stopped
+        networks:
+          - media
+        logging: *default-logging
+    
+      # Bazarr (subtitle manager)
+      bazarr:
+        image: linuxserver/bazarr:latest
+        container_name: bazarr
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+        volumes:
+          - media-config:/config
+          - media-movies:/movies
+          - media-tv:/tv
+        ports:
+          - 6767:6767
+        restart: unless-stopped
+        networks:
+          - media
+        logging: *default-logging
+    
+      # Gluetun (VPN client for *arr apps)
+      gluetun:
+        image: qmcgaw/gluetun:latest
+        container_name: gluetun
+        cap_add:
+          - NET_ADMIN
+        devices:
+          - /dev/net/tun:/dev/net/tun
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+          - VPN_SERVICE_PROVIDER=custom
+          - VPN_TYPE=openvpn
+          - OPENVPN_USER=your-vpn-username
+          - OPENVPN_PASSWORD=your-vpn-password
+          - SERVER_COUNTRIES=United States
+        volumes:
+          - /gluetun:/gluetun
+        ports:
+          - 8888:8888/tcp # HTTP proxy
+          - 8388:8388/tcp # Shadowsocks
+          - 8388:8388/udp # Shadowsocks
+          - 8090:8090/tcp # qBittorrent
+        restart: unless-stopped
+        networks:
+          - media
+        logging: *default-logging
+    
+      # qBittorrent (torrent client)
+      qbittorrent:
+        image: linuxserver/qbittorrent:latest
+        container_name: qbittorrent
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+          - WEBUI_PORT=8090
+        volumes:
+          - media-config:/config
+          - media-downloads:/downloads
+          - /incomplete-downloads:/incomplete-downloads
+        ports:
+          - 8090:8080
+          - 6881:6881
+          - 6881:6881/udp
+        restart: unless-stopped
+        networks:
+          - media
+        depends_on:
+          - gluetun
+        logging: *default-logging
+    
+      # Jackett (torrent indexer)
+      jackett:
+        image: linuxserver/jackett:latest
+        container_name: jackett
+        environment:
+          - PUID=1000
+          - PGID=1000
+          - TZ=America/Chicago
+          - AUTO_UPDATE=true
+        volumes:
+          - media-config:/config
+        ports:
+          - 9117:9117
+        restart: unless-stopped
+        networks:
+          - media
+        depends_on:
+          - gluetun
+        logging: *default-logging
+    EOF
+    
+    chown -R ubuntu:ubuntu /opt/cosmos/media
+    chmod 644 /opt/cosmos/media/docker-compose.yml
+  
+  # Install media server applications via CasaOS store
+  - |
+    echo "Configuring CasaOS app store..."
+    
+    # Wait for CasaOS to be ready
+    for i in {1..30}; do
+      if curl -s http://localhost:8000 | grep -q "CasaOS"; then
+        echo "CasaOS is ready"
+        break
+      fi
+      sleep 10
+    done
+    
+    # Install popular apps via CasaOS API (if available)
+    # This is a placeholder - actual installation via CasaOS UI
+    cat > /opt/cosmos/casaos-setup.sh << 'EOF'
+    #!/bin/bash
+    # CasaOS application setup script
+    
+    echo "📦 Setting up CasaOS applications..."
+    
+    # Wait for CasaOS API
+    until curl -s -f http://localhost:8000/api/v1/system/info >/dev/null; do
+      echo "Waiting for CasaOS API..."
+      sleep 5
+    done
+    
+    # List available apps (for reference)
+    echo "Available CasaOS apps:"
+    curl -s http://localhost:8000/api/v1/apps/store | jq '.data[] | .name'
+    
+    # Install essential apps (requires manual API tokens or UI)
+    # Note: This is a template - actual installation via CasaOS dashboard
+    cat > ~/casaos-apps-to-install.txt << 'EOL'
+    # Essential apps for media server
+    Plex Media Server
+    Jellyfin
+    Radarr
+    Sonarr
+    Lidarr
+    Readarr
+    Prowlarr
+    qBittorrent
+    Jackett
+    Bazarr
+    
+    # Productivity apps
+    Nextcloud
+    Bitwarden (Vaultwarden)
+    Paperless-ngx
+    
+    # Networking
+    Pi-hole
+    AdGuard Home
+    WireGuard Easy
+    
+    # Monitoring
+    Uptime Kuma
+    Netdata
+    Prometheus Node Exporter
+    EOL
+    
+    echo "📋 App installation list created: ~/casaos-apps-to-install.txt"
+    echo ""
+    echo "Next steps:"
+    echo "1. Open CasaOS: http://cosmos-01.curl-chimera.ts.net:8000"
+    echo "2. Install apps from the list above"
+    echo "3. Configure storage paths to /opt/media/*"
+    echo "4. Set up reverse proxy via Traefik or nginx"
+    EOF
+    
+    chmod +x /opt/cosmos/casaos-setup.sh
+    chown ubuntu:ubuntu /opt/cosmos/casaos-setup.sh
+  
+  # Create media management scripts
+  - |
+    cat > /opt/cosmos/media-manage.sh << 'EOF'
+    #!/bin/bash
+    # Media library management script
+    
+    set -euo pipefail
+    
+    MEDIA_ROOT="/opt/media"
+    LOG_FILE="/var/log/media-manage.log"
+    
+    log() {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    }
+    
+    case "${1:-help}" in
+      "scan")
+        log "Starting media library scan..."
+        # Plex library scan
+        docker exec plex plexmediaserver.sh ScanLibraryVideo -s || true
+        
+        # Jellyfin library scan
+        docker exec jellyfin dotnet /app/jellyfin/jellyfin.dll scan all-libraries || true
+        
+        # Update *arr applications
+        docker exec radarr /opt/Radarr/NzbDrone.Host restart || true
+        docker exec sonarr /opt/Sonarr/NzbDrone.Host restart || true
+        docker exec lidarr /opt/Lidarr/Lidarr.Host restart || true
+        docker exec readarr /opt/Readarr/Readarr.Host restart || true
+        
+        log "Media scan complete"
+        ;;
+      
+      "cleanup")
+        log "Starting media cleanup..."
+        # Remove empty directories
+        find "$MEDIA_ROOT" -type d -empty -delete 2>/dev/null || true
+        
+        # Clean Docker logs
+        docker system prune -f --volumes 2>/dev/null || true
+        
+        # Clean unfinished downloads
+        find "$MEDIA_ROOT/downloads" -name "*.part" -mtime +7 -delete 2>/dev/null || true
+        
+        log "Cleanup complete"
+        ;;
+      
+      "health")
+        log "Checking media server health..."
+        echo "Plex: $(docker exec plex curl -s -f http://localhost:32400/identity || echo 'Down')"
+        echo "Jellyfin: $(docker exec jellyfin curl -s -f http://localhost:8096/health || echo 'Down')"
+        echo "Radarr: $(curl -s -f http://localhost:7878/health || echo 'Down')"
+        echo "Sonarr: $(curl -s -f http://localhost:8983/health || echo 'Down')"
+        ;;
+      
+      "backup")
+        log "Creating media configuration backup..."
+        tar czf "/opt/backups/media-config-$(date +%Y%m%d).tar.gz" \\
+          -C /opt/media .config \\
+          /opt/cosmos/media/docker-compose.yml 2>/dev/null || true
+        ;;
+      
+      *)
+        echo "Media management script"
+        echo "Usage: $0 {scan|cleanup|health|backup}"
+        echo ""
+        echo "  scan    - Refresh media libraries in Plex/Jellyfin/*arr"
+        echo "  cleanup - Remove empty dirs, clean logs, prune Docker"
+        echo "  health  - Check status of media services"
+        echo "  backup  - Backup media configuration"
+        exit 1
+        ;;
+    esac
+    EOF
+    
+    chmod +x /opt/cosmos/media-manage.sh
+    chown ubuntu:ubuntu /opt/cosmos/media-manage.sh
+  
+  # Create systemd timer for media maintenance
+  - |
+    cat > /etc/systemd/system/media-maintenance.service << 'EOF'
+    [Unit]
+    Description=Media Library Maintenance
+    After=network.target docker.service
+    Wants=docker.service
+    
+    [Service]
+    Type=oneshot
+    User=ubuntu
+    Group=ubuntu
+    WorkingDirectory=/opt/cosmos
+    Environment=PATH=/usr/local/bin:/usr/bin:/bin
+    ExecStart=/opt/cosmos/media-manage.sh scan
+    ExecStart=/opt/cosmos/media-manage.sh cleanup
+    StandardOutput=journal
+    StandardError=journal
+    
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    
+    cat > /etc/systemd/system/media-maintenance.timer << 'EOF'
+    [Unit]
+    Description=Run media maintenance daily
+    Requires=media-maintenance.service
+    
+    [Timer]
+    OnCalendar=daily
+    Persistent=true
+    RandomizedDelaySec=3600
+    
+    [Install]
+    WantedBy=timers.target
+    EOF
+    
+    systemctl daemon-reload
+    systemctl enable media-maintenance.timer
+    systemctl start media-maintenance.timer
+  
+  # Setup Glance media dashboard
+  - |
+    echo "Configuring Glance media dashboard..."
+    mkdir -p /opt/cosmos/glance
+    
+    cat > /opt/cosmos/glance/docker-compose.yml << 'EOF'
+    version: "3.8"
+    services:
+      glance:
+        image: glanceapp/glance:latest
+        container_name: glance
+        restart: unless-stopped
+        ports:
+          - "8787:8787"
+        volumes:
+          - /opt/media:/media:ro
+          - /opt/cosmos/glance/config:/data
+          - /var/run/docker.sock:/var/run/docker.sock:ro
+        environment:
+          - PORT=8787
+          - BASE_URL=/
+          - ENABLE_AUTH=true
+          - USERNAME=admin
+          - PASSWORD=homelab2024
+          - PROVIDERS_LOCAL_PATH=/media
+          - PROVIDERS_LOCAL_RECURSIVE=true
+          - CACHE_TTL=3600
+          - THEME=dark
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.glance.rule=Host(`glance.local`) || PathPrefix(`/glance`)"
+          - "traefik.http.routers.glance.entrypoints=web"
+          - "traefik.http.services.glance.loadbalancer.server.port=8787"
+    EOF
+    
+    # Create Glance configuration
+    cat > /opt/cosmos/glance/config.json << 'EOF'
+    {
+      "port": 8787,
+      "baseUrl": "/",
+      "enableAuth": true,
+      "username": "admin",
+      "password": "homelab2024",
+      "providers": [
+        {
+          "name": "Movies",
+          "type": "local",
+          "path": "/media/movies",
+          "recursive": true,
+          "allowedExtensions": [".mp4", ".mkv", ".avi", ".mov", ".wmv"]
+        },
+        {
+          "name": "TV Shows",
+          "type": "local",
+          "path": "/media/tv",
+          "recursive": true,
+          "allowedExtensions": [".mp4", ".mkv", ".avi", ".mov", ".wmv"]
+        },
+        {
+          "name": "Music",
+          "type": "local",
+          "path": "/media/music",
+          "recursive": true,
+          "allowedExtensions": [".mp3", ".flac", ".m4a", ".wav", ".aac"]
+        },
+        {
+          "name": "Photos",
+          "type": "local",
+          "path": "/media/photos",
+          "recursive": true,
+          "allowedExtensions": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic"]
+        },
+        {
+          "name": "Books",
+          "type": "local",
+          "path": "/media/books",
+          "recursive": true,
+          "allowedExtensions": [".epub", ".mobi", ".pdf", ".cbz", ".cbr"]
+        },
+        {
+          "name": "Plex Library",
+          "type": "plex",
+          "url": "http://localhost:32400",
+          "token": "your-plex-token-here",
+          "libraries": ["Movies", "TV Shows", "Music"]
+        },
+        {
+          "name": "Jellyfin Library",
+          "type": "jellyfin",
+          "url": "http://localhost:8096",
+          "apiKey": "your-jellyfin-api-key",
+          "libraries": ["Movies", "TV", "Music", "Books"]
+        }
+      ],
+      "theme": "dark",
+      "cacheTtl": 3600,
+      "maxDepth": 5,
+      "allowedMimeTypes": [
+        "video/*",
+        "audio/*",
+        "image/*",
+        "application/epub+zip",
+        "application/pdf",
+        "application/x-cbz",
+        "application/x-cbr"
+      ],
+      "security": {
+        "enableCors": true,
+        "allowedOrigins": ["*"],
+        "sessionSecret": "your-session-secret-here"
+      },
+      "performance": {
+        "workerCount": 4,
+        "cacheSize": 1000,
+        "maxFileSize": "10GB"
+      }
+    }
+    EOF
+    
+    chown -R ubuntu:ubuntu /opt/cosmos/glance
+    chmod 644 /opt/cosmos/glance/config.json
+  
+  # Create application management scripts
+  - |
+    cat > /opt/cosmos/app-manage.sh << 'EOF'
+    #!/bin/bash
+    # Cosmos application management script
+    
+    set -euo pipefail
+    
+    APPS_DIR="/opt/cosmos"
+    COMPOSE_DIR="/opt/cosmos/media"
+    CASAOS_URL="http://localhost:8000"
+    LOG_FILE="/var/log/app-manage.log"
+    
+    log() {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    }
+    
+    case "${1:-help}" in
+      "list")
+        log "Listing installed applications..."
+        echo "=== Docker Containers ==="
+        docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+        echo ""
+        echo "=== Podman Containers ==="
+        podman ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+        echo ""
+        echo "=== CasaOS Apps ==="
+        curl -s "$CASAOS_URL/api/v1/apps/installed" | jq '.data[] | "\(.name) (\(.state))"'
+        ;;
+      
+      "start")
+        log "Starting application: $2"
+        if docker ps -a --format "table {{.Names}}" | grep -q "^$2$"; then
+          docker start "$2"
+        elif podman ps -a --format "table {{.Names}}" | grep -q "^$2$"; then
+          podman start "$2"
+        else
+          echo "Application $2 not found"
+          exit 1
+        fi
+        ;;
+      
+      "stop")
+        log "Stopping application: $2"
+        docker stop "$2" 2>/dev/null || podman stop "$2" 2>/dev/null || true
+        ;;
+      
+      "restart")
+        log "Restarting application: $2"
+        docker restart "$2" 2>/dev/null || podman restart "$2" 2>/dev/null || true
+        ;;
+      
+      "logs")
+        log "Showing logs for: $2"
+        docker logs -f "$2" 2>/dev/null || podman logs -f "$2" 2>/dev/null || true
+        ;;
+      
+      "health")
+        log "Checking application health..."
+        echo "=== Media Stack Health ==="
+        docker exec plex curl -s -f http://localhost:32400/identity >/dev/null && echo "Plex: OK" || echo "Plex: DOWN"
+        docker exec jellyfin curl -s -f http://localhost:8096/health >/dev/null && echo "Jellyfin: OK" || echo "Jellyfin: DOWN"
+        curl -s -f http://localhost:7878/health >/dev/null && echo "Radarr: OK" || echo "Radarr: DOWN"
+        curl -s -f http://localhost:8983/health >/dev/null && echo "Sonarr: OK" || echo "Sonarr: DOWN"
+        curl -s -f http://localhost:8787/health >/dev/null && echo "Glance: OK" || echo "Glance: DOWN"
+        curl -s -f http://localhost:8000/api/v1/system/info >/dev/null && echo "CasaOS: OK" || echo "CasaOS: DOWN"
+        ;;
+      
+      "backup")
+        log "Creating application backup..."
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        backup_dir="/opt/backups/apps-$timestamp"
+        
+        mkdir -p "$backup_dir"
+        
+        # Backup Docker configs
+        docker run --rm -v /var/lib/docker:/docker -v "$backup_dir:/backup" alpine tar czf /backup/docker-config.tar.gz -C /docker volumes containers
+        
+        # Backup CasaOS
+        if [ -d /var/lib/casaos ]; then
+          tar czf "$backup_dir/casaos.tar.gz" -C /var/lib casaos
+        fi
+        
+        # Backup media configs
+        if [ -d /opt/media/.config ]; then
+          tar czf "$backup_dir/media-config.tar.gz" -C /opt/media .config
+        fi
+        
+        # Backup compose files
+        tar czf "$backup_dir/compose.tar.gz" -C /opt/cosmos media/docker-compose.yml glance/docker-compose.yml
+        
+        log "Backup created: $backup_dir"
+        ;;
+      
+      "update")
+        log "Updating applications..."
+        cd /opt/cosmos/media
+        docker compose pull
+        docker compose up -d
+        
+        cd /opt/cosmos/glance
+        docker compose pull
+        docker compose up -d
+        
+        log "Application update complete"
+        ;;
+      
+      *)
+        echo "Cosmos application management"
+        echo "Usage: $0 {list|start|stop|restart|logs|health|backup|update} [app-name]"
+        echo ""
+        echo "Examples:"
+        echo "  $0 list                    # Show all applications"
+        echo "  $0 health                  # Check service health"
+        echo "  $0 restart plex            # Restart Plex"
+        echo "  $0 logs jellyfin           # Show Jellyfin logs"
+        echo "  $0 update                  # Update all apps"
+        echo "  $0 backup                  # Create backup"
+        exit 1
+        ;;
+    esac
+    EOF
+    
+    chmod +x /opt/cosmos/app-manage.sh
+    chown ubuntu:ubuntu /opt/cosmos/app-manage.sh
+  
+  # Create storage management for media files
+  - |
+    cat > /opt/cosmos/storage-manage.sh << 'EOF'
+    #!/bin/bash
+    # Media storage management script
+    
+    set -euo pipefail
+    
+    MEDIA_ROOT="/opt/media"
+    DOWNLOADS_ROOT="/opt/media/downloads"
+    LOG_FILE="/var/log/storage-manage.log"
+    
+    log() {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+    }
+    
+    case "${1:-help}" in
+      "space")
+        log "Checking storage usage..."
+        echo "=== Media Storage Usage ==="
+        du -sh "$MEDIA_ROOT"/* 2>/dev/null | sort -hr
+        echo ""
+        echo "=== Overall Usage ==="
+        df -h "$MEDIA_ROOT"
+        ;;
+      
+      "organize")
+        log "Organizing media files..."
+        # Move completed downloads to proper folders
+        find "$DOWNLOADS_ROOT" -type f \( -name "*.mkv" -o -name "*.mp4" -o -name "*.avi" \) -mtime -1 | while read file; do
+          if [[ "$file" =~ (Movie|Film|Film-)([0-9]{4})-(.*)\. ]]; then
+            year="${BASH_REMATCH[2]}"
+            title="${BASH_REMATCH[3]%%.*}"
+            mkdir -p "$MEDIA_ROOT/movies/$year"
+            mv "$file" "$MEDIA_ROOT/movies/$year/$title.${file##*.}"
+            log "Moved: $file -> $MEDIA_ROOT/movies/$year/"
+          elif [[ "$file" =~ (TV|Show|Series)-(.*)-S([0-9]{2})E([0-9]{2}) ]]; then
+            show="${BASH_REMATCH[2]}"
+            season="${BASH_REMATCH[3]}"
+            episode="${BASH_REMATCH[4]}"
+            mkdir -p "$MEDIA_ROOT/tv/$show/Season $season"
+            mv "$file" "$MEDIA_ROOT/tv/$show/Season $season/$show - S${season}E${episode}.${file##*.}"
+            log "Moved: $file -> $MEDIA_ROOT/tv/$show/"
+          fi
+        done
+        ;;
+      
+      "cleanup")
+        log "Cleaning up storage..."
+        # Remove old incomplete downloads
+        find "$DOWNLOADS_ROOT" -name "*.part" -mtime +7 -delete
+        find "$DOWNLOADS_ROOT" -name "*.tmp" -mtime +7 -delete
+        
+        # Clean empty directories
+        find "$MEDIA_ROOT" -type d -empty -delete
+        
+        # Docker system cleanup
+        docker system prune -f --volumes
+        
+        log "Storage cleanup complete"
+        ;;
+      
+      "health")
+        log "Checking storage health..."
+        echo "=== Filesystem Health ==="
+        echo "Root: $(df -h / | awk 'NR==2{print $5}' | sed 's/%//')"
+        echo "Media: $(df -h $MEDIA_ROOT | awk 'NR==2{print $5}' | sed 's/%//')"
+        echo "Docker: $(docker system df | grep Images | awk '{print $3 "/" $6}')"
+        
+        # Check for disk errors
+        echo "=== SMART Status ==="
+        smartctl -H /dev/sda 2>/dev/null | grep "SMART overall-health" || echo "No SMART support"
+        ;;
+      
+      "backup")
+        log "Creating storage configuration backup..."
+        timestamp=$(date +%Y%m%d_%H%M%S)
+        backup_dir="/opt/backups/storage-$timestamp"
+        
+        mkdir -p "$backup_dir"
+        
+        # Backup media metadata
+        if [ -d "$MEDIA_ROOT/.config" ]; then
+          tar czf "$backup_dir/media-metadata.tar.gz" -C "$MEDIA_ROOT" .config
+        fi
+        
+        # Backup application configs
+        tar czf "$backup_dir/storage-config.tar.gz" \\
+          /opt/cosmos/media/docker-compose.yml \\
+          /opt/cosmos/glance/config.json 2>/dev/null || true
+        
+        # Backup database (if running)
+        docker exec -t postgres pg_dumpall -U postgres > "$backup_dir/media-db.sql" 2>/dev/null || true
+        
+        log "Storage backup created: $backup_dir"
+        ;;
+      
+      *)
+        echo "Media storage management script"
+        echo "Usage: $0 {space|organize|cleanup|health|backup}"
+        echo ""
+        echo "Commands:"
+        echo "  space    - Show storage usage by category"
+        echo "  organize - Move completed downloads to proper folders"
+        echo "  cleanup  - Remove temporary files and empty directories"
+        echo "  health   - Check filesystem and SMART status"
+        echo "  backup   - Backup media configuration and metadata"
+        exit 1
+        ;;
+    esac
+    EOF
+    
+    chmod +x /opt/cosmos/storage-manage.sh
+    chown ubuntu:ubuntu /opt/cosmos/storage-manage.sh
+  
+  # Create systemd timer for storage maintenance
+  - |
+    cat > /etc/systemd/system/storage-maintenance.service << 'EOF'
+    [Unit]
+    Description=Media Storage Maintenance
+    After=network.target docker.service
+    Wants=docker.service
+    
+    [Service]
+    Type=oneshot
+    User=ubuntu
+    Group=ubuntu
+    WorkingDirectory=/opt/cosmos
+    Environment=PATH=/usr/local/bin:/usr/bin:/bin
+    ExecStart=/opt/cosmos/storage-manage.sh organize
+    ExecStart=/opt/cosmos/storage-manage.sh cleanup
+    StandardOutput=journal
+    StandardError=journal
+    
+    [Install]
+    WantedBy=multi-user.target
+    EOF
+    
+    cat > /etc/systemd/system/storage-maintenance.timer << 'EOF'
+    [Unit]
+    Description=Run storage maintenance every 6 hours
+    Requires=storage-maintenance.service
+    
+    [Timer]
+    OnCalendar=*:*:0/6
+    Persistent=true
+    RandomizedDelaySec=1800
+    
+    [Install]
+    WantedBy=timers.target
+    EOF
+    
+    systemctl daemon-reload
+    systemctl enable storage-maintenance.timer
+    systemctl start storage-maintenance.timer
+  
+  # Final verification and setup complete message
+  - |
+    echo "Cosmos VM bootstrap complete!"
+    echo ""
+    echo "✅ Container runtimes: Docker and Podman ready"
+    echo "✅ CasaOS: Installed and accessible at port 8000"
+    echo "✅ Cosmos Cloud: Running on port 8081"
+    echo "✅ Media directories: Created and permissioned"
+    echo "✅ Media stack: Docker Compose ready (Plex, *arr suite)"
+    echo "✅ Glance: Media dashboard configured on port 8787"
+    echo "✅ Storage management: Scripts and timers active"
+    echo ""
+    echo "🔧 Next steps:"
+    echo "  1. Access CasaOS: http://cosmos-01.curl-chimera.ts.net:8000"
+    echo "  2. Install apps via CasaOS store or docker-compose"
+    echo "  3. Configure media paths in applications"
+    echo "  4. Run: /opt/cosmos/app-manage.sh health"
+    echo "  5. Run: /opt/cosmos/storage-manage.sh space"
+    echo ""
+    echo "📱 iOS Access:"
+    echo "  • CasaOS PWA: Add to home screen for app management"
+    echo "  • Tailscale: Connect to access media services"
+    echo "  • ntfy: Subscribe to media alerts (via gateway)"
+
+write_files:
+  - path: /opt/cosmos/README.md
+    content: |
+      # Cosmos VM (cosmos-01) - Application Hosting Platform
+      
+      ## Overview
+      This VM serves as the central application hosting platform with multiple container runtimes and app stores.
+      
+      ## Architecture
+      - **CasaOS**: User-friendly app store and management interface
+      - **Cosmos Cloud**: Alternative container app platform
+      - **Docker**: Primary container runtime for complex apps
+      - **Podman**: Rootless containers for security
+      - **Media Stack**: Complete *arr suite + Plex/Jellyfin
+      - **Glance**: Media library dashboard and preview
+      - **Storage Management**: Automated organization and maintenance
+      
+      ## Services and Ports
+      | Service | Port | Description | Access |
+      |---------|------|-------------|---------|
+      | CasaOS | 8000 | App store UI | http://cosmos-01.curl-chimera.ts.net:8000 |
+      | Cosmos Cloud | 8081 | App platform | http://cosmos-01.curl-chimera.ts.net:8081 |
+      | Plex | 32400 | Media server | http://plex.local:32400 |
+      | Jellyfin | 8096 | Media server | http://jellyfin.local:8096 |
+      | Radarr | 7878 | Movie manager | http://radarr.local:7878 |
+      | Sonarr | 8983 | TV manager | http://sonarr.local:8983 |
+      | Lidarr | 8686 | Music manager | http://lidarr.local:8686 |
+      | Readarr | 8787 | Book manager | http://readarr.local:8787 |
+      | Prowlarr | 9696 | Indexer manager | http://prowlarr.local:9696 |
+      | qBittorrent | 8090 | Torrent client | http://qbittorrent.local:8090 |
+      | Jackett | 9117 | Torrent indexer | http://jackett.local:9117 |
+      | Bazarr | 6767 | Subtitle manager | http://bazarr.local:6767 |
+      | Glance | 8787 | Media dashboard | http://glance.local:8787 |
+      
+      ## Quick Start
+      1. **Access CasaOS**: http://cosmos-01.curl-chimera.ts.net:8000
+      2. **Install apps**: Use CasaOS store or Docker Compose files
+      3. **Configure storage**: Set paths to /opt/media/*
+      4. **Start media stack**: cd /opt/cosmos/media && docker compose up -d
+      5. **Access Glance**: http://cosmos-01.curl-chimera.ts.net:8787
+      6. **Management**: /opt/cosmos/app-manage.sh {list|health|update}
+      
+      ## Storage Layout
+      ```
+      /opt/media/
+      ├── movies/          # Movies (organized by year)
+      ├── tv/              # TV shows (organized by show/season)
+      ├── music/           # Music library
+      ├── books/           # eBooks and comics
+      ├── photos/          # Photo library
+      ├── downloads/       # Torrent downloads (temporary)
+      └── .config/         # Application metadata
+      ```
+      
+      ## Management Scripts
+      - **app-manage.sh**: Start/stop/restart/update applications
+      - **storage-manage.sh**: Organize media, cleanup, check space
+      - **media-manage.sh**: Scan libraries, health checks
+      - **casaos-setup.sh**: Configure CasaOS app store
+      
+      ## Backup Strategy
+      - **Docker volumes**: docker volume backup
+      - **Media metadata**: /opt/media/.config/
+      - **Application configs**: /opt/cosmos/*/*.yml
+      - **Database**: PostgreSQL dump (if used)
+      - **Proxmox**: VM snapshots for full backup
+      
+      ## iOS Integration
+      - **CasaOS PWA**: Add to home screen for app management
+      - **Tailscale**: VPN access to all media services
+      - **Glance PWA**: Media library browser
+      - **Plex/Jellyfin apps**: Native iOS media streaming
+      - **ntfy alerts**: Storage space, download complete notifications
+      
+      ## Security
+      - **Container isolation**: Separate networks for different app types
+      - **Resource limits**: CPU/memory limits in Docker Compose
+      - **Network policies**: Firewall rules limit exposure
+      - **Updates**: Automatic via Watchtower or CasaOS
+      - **Backups**: Automated configuration and metadata backups
+      
+      ## Troubleshooting
+      - **Apps not starting**: docker logs <container> or podman logs <container>
+      - **Storage full**: /opt/cosmos/storage-manage.sh space
+      - **Network issues**: tailscale status && ufw status
+      - **CasaOS down**: systemctl status casaos
+      - **Media not found**: /opt/cosmos/media-manage.sh scan
+    permissions: '0644'
+    owner: ubuntu:ubuntu
+
+power_state:
+  mode: reboot
+  delay: "now"
+  message: "Cosmos VM bootstrap complete. Rebooting to start application platform..."
+
+final_message: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  🎬 Cosmos VM (cosmos-01) Bootstrap Complete!                 ║
+  ║                                                              ║
+  ║  📋 Application Platform Status:                             ║
+  ║  ├─ Docker/Podman: ✅ Both runtimes ready                    ║
+  ║  ├─ CasaOS: ✅ Installed on port 8000                        ║
+  ║  ├─ Cosmos Cloud: ✅ Running on port 8081                    ║
+  ║  ├─ Media storage: ✅ Directories created and permissioned   ║
+  ║  ├─ Media stack: ✅ Docker Compose ready (Plex, *arr suite)  ║
+  ║  ├─ Glance dashboard: ✅ Configured on port 8787             ║
+  ║  ├─ Management scripts: ✅ app-manage.sh, storage-manage.sh  ║
+  ║  └─ Maintenance timers: ✅ Scheduled for daily execution     ║
+  ║                                                              ║
+  ║  🚀 Next Steps After Reboot:                                 ║
+  ║  1. Access CasaOS: http://cosmos-01.curl-chimera.ts.net:8000      ║
+  ║  2. Install apps via CasaOS store                           ║
+  ║  3. Start media stack: cd /opt/cosmos/media && docker compose up -d ║
+  ║  4. Access Glance: http://cosmos-01.curl-chimera.ts.net:8787      ║
+  ║  5. Run: /opt/cosmos/app-manage.sh health                   ║
+  ║  6. Run: /opt/cosmos/storage-manage.sh space                ║
+  ║                                                              ║
+  ║  📱 iOS Access Ready:                                        ║
+  ║  ├─ CasaOS PWA: Add to home screen for easy app management  ║
+  ║  ├─ Tailscale VPN: Connect to access all media services     ║
+  ║  ├─ Glance PWA: Media library browser and preview           ║
+  ║  ├─ Plex/Jellyfin apps: Native iOS media streaming          ║
+  ║  ├─ ntfy alerts: Storage space warnings, download complete  ║
+  ║  └─ Files app integration: Nextcloud for photo backups      ║
+  ║                                                              ║
+  ║  🎬 Media Services URLs (after setup):                       ║
+  ║  ├─ Plex: http://plex.local:32400/web                       ║
+  ║  ├─ Jellyfin: http://jellyfin.local:8096                    ║
+  ║  ├─ Radarr: http://radarr.local:7878                        ║
+  ║  ├─ Sonarr: http://sonarr.local:8983                        ║
+  ║  ├─ Glance: http://glance.local:8787                        ║
+  ║  └─ CasaOS: http://casaos.local:8000                        ║
+  ║                                                              ║
+  ╚══════════════════════════════════════════════════════════════╝

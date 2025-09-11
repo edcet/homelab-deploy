@@ -1,0 +1,21 @@
+[Unit]
+Description=Homelab Podman Event Watcher
+After=network.target podman.service
+Requires=podman.service
+Wants=traefik.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/homelab/gateway/scripts
+EnvironmentFile=/opt/homelab/gateway/.env
+ExecStart=/usr/bin/python3 /opt/homelab/gateway/scripts/watcher.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
