@@ -29,10 +29,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install dependencies (non-blocking)
         run: |
           npm i -g pnpm@9
-          pnpm install
+          pnpm install || echo "Non-fatal: pnpm install failed; continuing analysis without Node deps"
           pip install g4f
 
       - name: Perplexity API Analysis
