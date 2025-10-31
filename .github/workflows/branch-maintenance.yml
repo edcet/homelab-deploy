@@ -1,0 +1,311 @@
+name: Branch Maintenance & Automation
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+      - 'README.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      full_sync:
+        description: 'Perform full branch synchronization'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  audit-and-maintain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for all branches
+      
+      - name: Configure Git
+        run: |
+          git config --global user.name "homelab-bot[bot]"
+          git config --global user.email "homelab-bot[bot]@users.noreply.github.com"
+      
+      - name: Audit all branches
+        id: audit
+        run: |
+          echo "## Branch Audit Report" > audit-report.md
+          echo "Generated: $(date -u +\"%Y-%m-%d %H:%M:%S UTC\")" >> audit-report.md
+          echo "" >> audit-report.md
+          
+          # List all branches
+          git branch -r | grep -v HEAD | sed 's|origin/||' > branches.txt
+          
+          echo "### Deployment Branches Status" >> audit-report.md
+          for branch in docker-deploy k8s-deploy pulumi-deploy monitoring-stack; do
+            if grep -q "^$branch$" branches.txt; then
+              echo "- ✅ **$branch**: Active" >> audit-report.md
+              
+              # Check if README is specialized
+              git checkout $branch 2>/dev/null
+              if grep -q "Branch Purpose" README.md 2>/dev/null; then
+                echo "  - README: Specialized ✅" >> audit-report.md
+              else
+                echo "  - README: Needs specialization ⚠️" >> audit-report.md
+                echo "$branch" >> needs-readme-update.txt
+              fi
+            else
+              echo "- ❌ **$branch**: Missing" >> audit-report.md
+              echo "$branch" >> missing-branches.txt
+            fi
+          done
+          
+          git checkout main
+          
+          # Check for OSS compliance
+          echo "" >> audit-report.md
+          echo "### OSS Compliance Check" >> audit-report.md
+          
+          # Check for non-OSS keywords
+          if grep -rI "proprietary\|licensed\|commercial" . --exclude-dir=.git 2>/dev/null; then
+            echo "- ⚠️ Potential non-OSS content detected" >> audit-report.md
+            echo "has_non_oss=true" >> $GITHUB_OUTPUT
+          else
+            echo "- ✅ All content appears OSS-compatible" >> audit-report.md
+            echo "has_non_oss=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check automation health
+          echo "" >> audit-report.md
+          echo "### Automation Health" >> audit-report.md
+          
+          workflow_count=$(find .github/workflows -name '*.yml' -o -name '*.yaml' | wc -l)
+          echo "- Active workflows: $workflow_count" >> audit-report.md
+          
+          # Check for required automation scripts
+          if [ -f "maintenance/health.sh" ]; then
+            echo "- ✅ Health check script: Present" >> audit-report.md
+          else
+            echo "- ⚠️ Health check script: Missing" >> audit-report.md
+          fi
+          
+          cat audit-report.md
+          echo "report<<EOF" >> $GITHUB_OUTPUT
+          cat audit-report.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Sync shared assets to deployment branches
+        if: github.event.inputs.full_sync == 'true' || github.event_name == 'schedule'
+        run: |
+          # Assets to sync across branches
+          SHARED_ASSETS="
+            maintenance/health.sh
+            .github/workflows/deploy.yaml
+            .env
+          "
+          
+          for branch in docker-deploy k8s-deploy pulumi-deploy monitoring-stack; do
+            if git rev-parse --verify origin/$branch >/dev/null 2>&1; then
+              echo "Syncing shared assets to $branch..."
+              git checkout $branch
+              
+              # Sync shared files
+              for asset in $SHARED_ASSETS; do
+                if [ -f "$asset" ] || git show main:"$asset" >/dev/null 2>&1; then
+                  git checkout main -- "$asset" 2>/dev/null || true
+                fi
+              done
+              
+              # Commit if changes exist
+              if ! git diff --quiet; then
+                git add -A
+                git commit -m "chore: Sync shared assets from main branch
+                
+                Automated sync of shared maintenance scripts and configurations.
+                
+                Synced by: branch-maintenance workflow
+                Timestamp: $(date -u +\"%Y-%m-%d %H:%M:%S UTC\")"
+                git push origin $branch
+              fi
+            fi
+          done
+          
+          git checkout main
+      
+      - name: Update main README with branch status
+        run: |
+          # Create branch status badge section
+          cat > branch-status.md <<'EOF'
+          
+          ## 📊 Branch Status Dashboard
+          
+          | Branch | Status | Last Updated | Purpose |
+          |--------|--------|--------------|----------|
+EOF
+          
+          for branch in main docker-deploy k8s-deploy pulumi-deploy monitoring-stack; do
+            if git rev-parse --verify origin/$branch >/dev/null 2>&1; then
+              last_commit=$(git log origin/$branch -1 --format="%ar" 2>/dev/null || echo "unknown")
+              
+              case $branch in
+                main)
+                  purpose="Development & Integration"
+                  ;;
+                docker-deploy)
+                  purpose="Docker Compose + systemd"
+                  ;;
+                k8s-deploy)
+                  purpose="Kubernetes + Kustomize"
+                  ;;
+                pulumi-deploy)
+                  purpose="Pulumi IaC"
+                  ;;
+                monitoring-stack)
+                  purpose="Monitoring stack"
+                  ;;
+              esac
+              
+              echo "| **[$branch](../../tree/$branch)** | ✅ Active | $last_commit | $purpose |" >> branch-status.md
+            else
+              echo "| **$branch** | ❌ Missing | N/A | N/A |" >> branch-status.md
+            fi
+          done
+          
+          echo "" >> branch-status.md
+          echo "*Last automated check: $(date -u +\"%Y-%m-%d %H:%M:%S UTC\")*" >> branch-status.md
+          
+          # The branch status could be inserted into README if desired
+          # For now, just save it as an artifact
+      
+      - name: Create maintenance issue if problems detected
+        if: steps.audit.outputs.has_non_oss == 'true' || hashFiles('missing-branches.txt') != '' || hashFiles('needs-readme-update.txt') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let issueBody = '## 🤖 Automated Branch Maintenance Report\n\n';
+            issueBody += `Generated: ${new Date().toUTCString()}\n\n`;
+            
+            // Check for missing branches
+            if (fs.existsSync('missing-branches.txt')) {
+              const missing = fs.readFileSync('missing-branches.txt', 'utf8').trim();
+              if (missing) {
+                issueBody += '### ⚠️ Missing Branches\n\n';
+                issueBody += missing.split('\n').map(b => `- \`${b}\``).join('\n');
+                issueBody += '\n\n';
+              }
+            }
+            
+            // Check for branches needing README updates
+            if (fs.existsSync('needs-readme-update.txt')) {
+              const needsUpdate = fs.readFileSync('needs-readme-update.txt', 'utf8').trim();
+              if (needsUpdate) {
+                issueBody += '### 📝 Branches Needing README Specialization\n\n';
+                issueBody += needsUpdate.split('\n').map(b => `- \`${b}\``).join('\n');
+                issueBody += '\n\n';
+              }
+            }
+            
+            // Check for OSS compliance issues
+            if ('${{ steps.audit.outputs.has_non_oss }}' === 'true') {
+              issueBody += '### 🔍 OSS Compliance Review Needed\n\n';
+              issueBody += 'Potential non-OSS content detected. Manual review required.\n\n';
+            }
+            
+            // Add full audit report
+            issueBody += '### 📊 Full Audit Report\n\n';
+            issueBody += '```\n';
+            issueBody += fs.readFileSync('audit-report.md', 'utf8');
+            issueBody += '\n```\n';
+            
+            // Create the issue
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🤖 Automated Maintenance: Action Required - ${new Date().toISOString().split('T')[0]}`,
+              body: issueBody,
+              labels: ['automation', 'maintenance', 'bot-generated']
+            });
+      
+      - name: Upload audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: branch-audit-report-${{ github.run_number }}
+          path: |
+            audit-report.md
+            branch-status.md
+            missing-branches.txt
+            needs-readme-update.txt
+          retention-days: 90
+      
+      - name: Comment on Issue #2 with status update
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('audit-report.md', 'utf8');
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: 2,
+              body: `## 🤖 Automated Branch Audit\n\nRun #${context.runNumber} completed at ${new Date().toUTCString()}\n\n${report}\n\n---\n*Automated by [branch-maintenance workflow](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})*`
+            });
+
+  # Additional job for cross-branch testing
+  validate-deployment-patterns:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        branch: [docker-deploy, k8s-deploy, pulumi-deploy, monitoring-stack]
+    
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+      
+      - name: Validate branch structure
+        run: |
+          echo "Validating ${{ matrix.branch }}..."
+          
+          # Check README exists and is specialized
+          if [ ! -f "README.md" ]; then
+            echo "::error::README.md missing on ${{ matrix.branch }}"
+            exit 1
+          fi
+          
+          if ! grep -q "Branch Purpose" README.md; then
+            echo "::warning::README.md on ${{ matrix.branch }} may not be specialized"
+          fi
+          
+          # Branch-specific validations
+          case "${{ matrix.branch }}" in
+            docker-deploy)
+              [ -d "gateway/compose" ] || echo "::warning::gateway/compose directory missing"
+              [ -f "gateway/systemd/watcher.service" ] || echo "::warning::systemd service file missing"
+              ;;
+            k8s-deploy)
+              [ -d "kustomize" ] || echo "::warning::kustomize directory missing"
+              [ -f "kustomize/olares/monitoring/kustomization.yaml" ] || echo "::warning::kustomization.yaml missing"
+              ;;
+            pulumi-deploy)
+              [ -d "pulumi" ] || echo "::warning::pulumi directory missing"
+              [ -f "pulumi/Pulumi.yaml" ] || echo "::warning::Pulumi.yaml missing"
+              [ -f "package.json" ] || echo "::warning::package.json missing"
+              ;;
+            monitoring-stack)
+              [ -d "kustomize/olares/monitoring" ] || echo "::warning::monitoring directory missing"
+              ;;
+          esac
+          
+          echo "✅ Validation completed for ${{ matrix.branch }}"
