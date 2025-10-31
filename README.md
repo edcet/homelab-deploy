@@ -1,6 +1,56 @@
 # VM-Centric Homelab Deployment on Proxmox 9
 
-## Overview
+## 🚀 Deployment Options & Branch Navigation
+
+This repository supports multiple deployment patterns through dedicated branches. Choose the approach that best fits your infrastructure:
+
+| Branch | Stack | Use Case | Quick Start |
+|--------|-------|----------|-------------|
+| **[docker-deploy](../../tree/docker-deploy)** | Docker Compose + Podman + systemd | Bare-metal/VM container deployments without orchestration | Deploy gateway services, standalone apps |
+| **[k8s-deploy](../../tree/k8s-deploy)** | Kubernetes + Kustomize + GitOps | Existing K8s/K3s/Talos clusters | Declarative K8s manifests for cluster deployment |
+| **[pulumi-deploy](../../tree/pulumi-deploy)** | Pulumi TypeScript IaC | Full infrastructure provisioning (VMs, networks, cloud-init) | Complete homelab from code |
+| **[monitoring-stack](../../tree/monitoring-stack)** | Prometheus + Grafana + AlertManager | Standalone monitoring/observability | Add monitoring to any deployment |
+| **[main](../../tree/main)** | Integrated development | Active development, testing, integration | Current branch (you are here) |
+
+### Branch-Specific Documentation
+
+Each deployment branch contains:
+- ✅ **Branch-specific README** with focused quick start guide
+- ✅ **Production-ready configuration** for that deployment pattern
+- ✅ **Prerequisites and dependencies** clearly documented
+- ✅ **Deployment commands** and troubleshooting
+- ✅ **Cross-branch integration guides** where applicable
+
+### Deployment Pattern Selection Guide
+
+**Choose `docker-deploy` if:**
+- Running on bare-metal or VMs without Kubernetes
+- Want simple Docker Compose deployments
+- Need systemd integration for auto-restart
+- Prefer Podman for rootless containers
+
+**Choose `k8s-deploy` if:**
+- Already have a Kubernetes cluster (K3s, K8s, Talos, etc.)
+- Want GitOps-ready manifests
+- Need declarative cluster state management
+- Prefer Kustomize for configuration
+
+**Choose `pulumi-deploy` if:**
+- Need full infrastructure automation
+- Want TypeScript-based IaC
+- Provisioning VMs on Proxmox/cloud providers
+- Require cloud-init bootstrapping
+
+**Choose `monitoring-stack` if:**
+- Adding observability to existing infrastructure
+- Want standalone Prometheus + Grafana
+- Need alerting via ntfy/Pushover
+- Independent from other deployments
+
+---
+
+## Overview (Main Branch)
+
 Implementation of the finalized architecture for a single-node Proxmox 9 homelab on Dell R240 (38GB RAM, 18TB ZFS, BOSS S1 SSD). Features:
 - 4 isolated VMs: gw-01 (gateway), olares-01 (k3s orchestration), cosmos-01 (app hosting), ynh-01 (YunoHost services)
 - Pure single-node k3s in olares-01 (no multi-cluster/Flux)
@@ -59,6 +109,14 @@ homelab-deploy/
 | ynh-01 | 4 | 8GB | 300GB | YunoHost, Nextcloud, Homepage dashboard |
 
 Total allocation: 14 vCPU, 28GB RAM (leaves headroom on 38GB total).
+
+## Contributing & Development
+
+See [Issue #2](../../issues/2) for the comprehensive repository restructuring plan, including:
+- Cross-branch synchronization strategy
+- Migration guides between deployment patterns
+- Future enhancements (Terraform modules, Helm charts, Ansible playbooks)
+- Backup/restore procedures per deployment type
 
 ## License
 MIT - Free for personal homelab use.
