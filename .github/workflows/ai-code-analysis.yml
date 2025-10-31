@@ -1,0 +1,93 @@
+name: AI Code Analysis
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps
+        run: |
+          npm i -g pnpm@9
+          pnpm install
+
+      - name: Perplexity analysis
+        id: perplexity
+        uses: perplexity-ai/actions-code-review@v1
+        env:
+          PPLX_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          paths: |
+            pulumi/**
+            **/*.ts
+            **/*.yml
+
+      - name: Amazon Q code review
+        id: amazonq
+        uses: aws-actions/amazon-q-developer-cli@v1
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        with:
+          command: review --format json --output q-review.json
+
+      - name: G4F analysis
+        id: g4f
+        uses: mugen-build/github-action-g4f@v1
+        with:
+          prompt: |
+            Review this repo for infra/security/CI improvements.
+          files_glob: |
+            pulumi/**
+            .github/workflows/**
+            package.json
+
+      - name: Synthesize combined report
+        id: synth
+        run: |
+          echo "## AI Analysis Report" > REPORT.md
+          echo "### Perplexity" >> REPORT.md
+          echo "${{ steps.perplexity.outputs.report || 'No report' }}" >> REPORT.md
+          echo "\n### Amazon Q" >> REPORT.md
+          if [ -f q-review.json ]; then cat q-review.json >> REPORT.md; else echo 'No Q output' >> REPORT.md; fi
+          echo "\n### G4F" >> REPORT.md
+          echo "${{ steps.g4f.outputs.result || 'No G4F output' }}" >> REPORT.md
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-analysis-report
+          path: REPORT.md
+
+      - name: Create or update PR with fixes
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(ai): apply AI analysis recommendations"
+          title: "AI Analysis Improvements"
+          body: |
+            Automated PR containing recommendations from Perplexity, Amazon Q, and G4F.
+            See attached REPORT.md artifact.
+          branch: chore/ai-analysis-improvements
+          base: main
