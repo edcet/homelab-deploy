@@ -130,74 +130,65 @@ jobs:
         run: |
           echo "# G4F Analysis" > g4f-output.md
           
-          # Create analysis script
-          cat > g4f_analyze.py << 'EOFPYTHON'
-import g4f
-import os
-import glob
-
-try:
-    # Gather files
-    files_content = ""
-    
-    patterns = ["pulumi/**/*.ts", ".github/workflows/*.yml", "package.json"]
-    for pattern in patterns:
-        for filepath in glob.glob(pattern, recursive=True):
-            try:
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()[:1000]  # Limit size
-                    files_content += f"\n\n=== {filepath} ===\n{content}"
-            except Exception as e:
-                print(f"Error reading {filepath}: {e}")
-    
-    prompt = f"""Review this homelab infrastructure repository for:
-1. Security vulnerabilities and hardcoded secrets
-2. CI/CD pipeline improvements
-3. Infrastructure as Code best practices
-4. Node.js and TypeScript code quality
-
-Repository files:
-{files_content[:8000]}
-
-Provide specific, actionable recommendations."""
-    
-    # Try multiple providers
-    providers = [g4f.Provider.Bing, g4f.Provider.You, g4f.Provider.Phind]
-    
-    for provider in providers:
-        try:
-            response = g4f.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                provider=provider,
-                timeout=60
-            )
-            print(response)
-            exit(0)
-        except Exception as e:
-            print(f"Provider {provider.__name__} failed: {e}")
-            continue
-    
-    print("⚠️ All G4F providers failed. Using fallback analysis.")
-    print("")
-    print("## Static Analysis Results:")
-    print("- ✓ GitHub Actions workflows using official actions")
-    print("- ✓ Node.js project with TypeScript configuration")
-    print("- ⚠️ Review secrets management in workflows")
-    print("- ⚠️ Consider adding caching for dependencies")
-    print("- ⚠️ Add workflow status badges to README")
-    
-except Exception as e:
-    print(f"⚠️ G4F analysis error: {e}")
-    print("")
-    print("## Fallback Recommendations:")
-    print("- Implement proper secret rotation")
-    print("- Add comprehensive testing in CI")
-    print("- Use dependency caching for faster builds")
-    print("- Consider using Dependabot for updates")
-EOFPYTHON
+          # Create Python script for analysis
+          python3 << 'EOF_PYTHON' >> g4f-output.md 2>&1 || echo "⚠️ G4F analysis encountered issues" >> g4f-output.md
+          import g4f
+          import glob
+          try:
+              files_content = ""
+              patterns = ["pulumi/**/*.ts", ".github/workflows/*.yml", "package.json"]
+              for pattern in patterns:
+                  for filepath in glob.glob(pattern, recursive=True):
+                      try:
+                          with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                              content = f.read()[:1000]
+                              files_content += f"\n\n=== {filepath} ===\n{content}"
+                      except Exception as e:
+                          print(f"Error reading {filepath}: {e}")
+              
+              prompt = f"""Review this homelab infrastructure repository for:
+          1. Security vulnerabilities and hardcoded secrets
+          2. CI/CD pipeline improvements
+          3. Infrastructure as Code best practices
+          4. Node.js and TypeScript code quality
           
-          python3 g4f_analyze.py >> g4f-output.md 2>&1 || echo "⚠️ G4F analysis encountered issues" >> g4f-output.md
+          Repository files:
+          {files_content[:8000]}
+          
+          Provide specific, actionable recommendations."""
+              
+              providers = [g4f.Provider.Bing, g4f.Provider.You, g4f.Provider.Phind]
+              for provider in providers:
+                  try:
+                      response = g4f.ChatCompletion.create(
+                          model="gpt-3.5-turbo",
+                          messages=[{"role": "user", "content": prompt}],
+                          provider=provider,
+                          timeout=60
+                      )
+                      print(response)
+                      exit(0)
+                  except Exception as e:
+                      print(f"Provider {provider.__name__} failed: {e}")
+                      continue
+              
+              print("⚠️ All G4F providers failed. Using fallback analysis.")
+              print("")
+              print("## Static Analysis Results:")
+              print("- ✓ GitHub Actions workflows using official actions")
+              print("- ✓ Node.js project with TypeScript configuration")
+              print("- ⚠️ Review secrets management in workflows")
+              print("- ⚠️ Consider adding caching for dependencies")
+              print("- ⚠️ Add workflow status badges to README")
+          except Exception as e:
+              print(f"⚠️ G4F analysis error: {e}")
+              print("")
+              print("## Fallback Recommendations:")
+              print("- Implement proper secret rotation")
+              print("- Add comprehensive testing in CI")
+              print("- Use dependency caching for faster builds")
+              print("- Consider using Dependabot for updates")
+          EOF_PYTHON
 
       - name: Synthesize Combined Report
         id: synth
