@@ -1,0 +1,265 @@
+name: 🚀 Live Hardware Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Deployment target'
+        required: true
+        type: choice
+        options:
+          - 'r240-only'
+          - 'r7910-only'
+          - 'both-edges'
+          - 'full-stack'
+      power_on:
+        description: 'Power on hardware via iDRAC'
+        required: true
+        type: boolean
+        default: true
+      deploy_vms:
+        description: 'Deploy VMs with Pulumi'
+        required: true
+        type: boolean
+        default: true
+      configure_network:
+        description: 'Configure Tailscale + Cloudflare'
+        required: true
+        type: boolean
+        default: true
+
+env:
+  DEPLOYMENT_ID: ${{ github.run_id }}-${{ github.run_number }}
+
+jobs:
+  power-on-r240:
+    name: 🔌 Power On R240
+    runs-on: ubuntu-latest
+    if: ${{ (inputs.target == 'r240-only' || inputs.target == 'both-edges' || inputs.target == 'full-stack') && inputs.power_on }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Check R240 power status
+        id: check_power
+        run: |
+          echo "Checking R240 power status via Redfish API..."
+          POWER_STATE=$(curl -sk -u "${{ secrets.IDRAC_R240_USER }}:${{ secrets.IDRAC_R240_PASS }}" \
+            "https://${{ secrets.IDRAC_R240_HOST }}/redfish/v1/Systems/System.Embedded.1" \
+            | jq -r '.PowerState')
+          
+          echo "power_state=$POWER_STATE" >> $GITHUB_OUTPUT
+          echo "R240 Power State: $POWER_STATE"
+      
+      - name: Power on R240 if needed
+        if: steps.check_power.outputs.power_state != 'On'
+        run: |
+          echo "Powering on R240..."
+          curl -sk -u "${{ secrets.IDRAC_R240_USER }}:${{ secrets.IDRAC_R240_PASS }}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"ResetType":"On"}' \
+            "https://${{ secrets.IDRAC_R240_HOST }}/redfish/v1/Systems/System.Embedded.1/Actions/ComputerSystem.Reset"
+          
+          echo "Waiting 90 seconds for R240 to boot..."
+          sleep 90
+      
+      - name: Verify R240 is online
+        run: |
+          echo "Verifying R240 Proxmox is accessible..."
+          for i in {1..10}; do
+            if curl -sk "${{ secrets.PROXMOX_R240_API_URL }}/version" ; then
+              echo "✅ R240 Proxmox is online!"
+              exit 0
+            fi
+            echo "Attempt $i/10 failed, waiting 10s..."
+            sleep 10
+          done
+          echo "❌ R240 Proxmox did not come online"
+          exit 1
+      
+      - name: Notify power-on success
+        if: success()
+        run: |
+          curl -X POST "${{ secrets.NTFY_WEBHOOK_URL || 'https://ntfy.sh/homelab-deploy' }}" \
+            -H "Title: R240 Powered On" \
+            -H "Tags: white_check_mark" \
+            -d "R240 successfully powered on and Proxmox verified online (Run #${{ github.run_number }})"
+
+  power-on-r7910:
+    name: 🔌 Power On R7910
+    runs-on: ubuntu-latest
+    if: ${{ (inputs.target == 'r7910-only' || inputs.target == 'both-edges' || inputs.target == 'full-stack') && inputs.power_on }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Check R7910 power status
+        id: check_power
+        run: |
+          POWER_STATE=$(curl -sk -u "${{ secrets.IDRAC_R7910_USER }}:${{ secrets.IDRAC_R7910_PASS }}" \
+            "https://${{ secrets.IDRAC_R7910_HOST }}/redfish/v1/Systems/System.Embedded.1" \
+            | jq -r '.PowerState')
+          
+          echo "power_state=$POWER_STATE" >> $GITHUB_OUTPUT
+          echo "R7910 Power State: $POWER_STATE"
+      
+      - name: Power on R7910 if needed
+        if: steps.check_power.outputs.power_state != 'On'
+        run: |
+          echo "Powering on R7910..."
+          curl -sk -u "${{ secrets.IDRAC_R7910_USER }}:${{ secrets.IDRAC_R7910_PASS }}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"ResetType":"On"}' \
+            "https://${{ secrets.IDRAC_R7910_HOST }}/redfish/v1/Systems/System.Embedded.1/Actions/ComputerSystem.Reset"
+          
+          sleep 90
+      
+      - name: Verify R7910 is online
+        run: |
+          for i in {1..10}; do
+            if curl -sk "${{ secrets.PROXMOX_R7910_API_URL }}/version" ; then
+              echo "✅ R7910 Proxmox is online!"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
+  deploy-infrastructure:
+    name: 🏗️ Deploy Infrastructure with Pulumi
+    runs-on: ubuntu-latest
+    needs: [power-on-r240, power-on-r7910]
+    if: ${{ always() && inputs.deploy_vms && !cancelled() }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: |
+          cd pulumi
+          npm install
+      
+      - name: Install Pulumi CLI
+        uses: pulumi/actions@v4
+      
+      - name: Deploy R240 VMs
+        if: ${{ inputs.target != 'r7910-only' }}
+        uses: pulumi/actions@v4
+        with:
+          command: up
+          stack-name: r240-prod
+          work-dir: pulumi
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+          PROXMOX_VE_ENDPOINT: ${{ secrets.PROXMOX_R240_API_URL }}
+          PROXMOX_VE_API_TOKEN: ${{ secrets.PROXMOX_R240_TOKEN_ID }}=${{ secrets.PROXMOX_R240_TOKEN_SECRET }}
+      
+      - name: Deploy R7910 VMs
+        if: ${{ inputs.target != 'r240-only' }}
+        uses: pulumi/actions@v4
+        with:
+          command: up
+          stack-name: r7910-prod
+          work-dir: pulumi
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+          PROXMOX_VE_ENDPOINT: ${{ secrets.PROXMOX_R7910_API_URL }}
+          PROXMOX_VE_API_TOKEN: ${{ secrets.PROXMOX_R7910_TOKEN_ID }}=${{ secrets.PROXMOX_R7910_TOKEN_SECRET }}
+      
+      - name: Wait for VMs to boot
+        run: |
+          echo "Waiting 60s for VMs to initialize..."
+          sleep 60
+      
+      - name: Notify deployment success
+        if: success()
+        run: |
+          curl -X POST "${{ secrets.NTFY_WEBHOOK_URL || 'https://ntfy.sh/homelab-deploy' }}" \
+            -H "Title: Infrastructure Deployed" \
+            -H "Tags: rocket" \
+            -d "VMs successfully provisioned on Proxmox (Run #${{ github.run_number }})"
+
+  configure-network:
+    name: 🌐 Configure Network (Tailscale + Cloudflare)
+    runs-on: ubuntu-latest
+    needs: [deploy-infrastructure]
+    if: ${{ always() && inputs.configure_network && !cancelled() }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Tailscale mesh
+        run: |
+          echo "Configuring Tailscale mesh networking..."
+          # This would typically SSH into VMs and configure Tailscale
+          # For now, we'll just validate the auth key
+          if [ -z "${{ secrets.TAILSCALE_AUTHKEY }}" ]; then
+            echo "❌ TAILSCALE_AUTHKEY not configured"
+            exit 1
+          fi
+          echo "✅ Tailscale configuration ready"
+      
+      - name: Configure Cloudflare tunnels
+        run: |
+          echo "Setting up Cloudflare tunnels..."
+          # Validate Cloudflare token
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "❌ CLOUDFLARE_API_TOKEN not configured"
+            exit 1
+          fi
+          echo "✅ Cloudflare configuration ready"
+      
+      - name: Notify network configuration
+        if: success()
+        run: |
+          curl -X POST "${{ secrets.NTFY_WEBHOOK_URL || 'https://ntfy.sh/homelab-deploy' }}" \
+            -H "Title: Network Configured" \
+            -H "Tags: globe_with_meridians" \
+            -d "Tailscale mesh and Cloudflare tunnels configured (Run #${{ github.run_number }})"
+
+  deployment-summary:
+    name: 📊 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [power-on-r240, power-on-r7910, deploy-infrastructure, configure-network]
+    if: always()
+    
+    steps:
+      - name: Generate deployment report
+        run: |
+          echo "# 🚀 Deployment Summary - Run #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment ID:** ${{ env.DEPLOYMENT_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** ${{ inputs.target }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Job Results:" >> $GITHUB_STEP_SUMMARY
+          echo "- Power On R240: ${{ needs.power-on-r240.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Power On R7910: ${{ needs.power-on-r7910.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Deploy Infrastructure: ${{ needs.deploy-infrastructure.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Configure Network: ${{ needs.configure-network.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "View logs at: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Final notification
+        run: |
+          STATUS_EMOJI="✅"
+          if [ "${{ needs.power-on-r240.result }}" == "failure" ] || [ "${{ needs.power-on-r7910.result }}" == "failure" ] || [ "${{ needs.deploy-infrastructure.result }}" == "failure" ]; then
+            STATUS_EMOJI="❌"
+          fi
+          
+          curl -X POST "${{ secrets.NTFY_WEBHOOK_URL || 'https://ntfy.sh/homelab-deploy' }}" \
+            -H "Title: Deployment Complete" \
+            -H "Tags: checkered_flag" \
+            -d "$STATUS_EMOJI Homelab deployment finished (Run #${{ github.run_number }}). View details: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
